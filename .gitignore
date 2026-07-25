@@ -544,3 +544,15 @@ criterion/
 flamegraph.svg
 perf.data*
 *.qlog
+
+# The UI bundle is deliberately committed.
+#
+# The Rust build must work with no network — CI vendors crates and builds
+# --offline — so an `npm ci` cannot sit in front of `cargo build`, and
+# `dafs-api` embeds this file with include_str!. Committing the output keeps
+# the Rust side hermetic and the Nix flake free of node entirely.
+#
+# It cannot go stale: CI rebuilds the frontend and fails if the result differs
+# from what is committed. See .github/workflows/ci.yml.
+!ui/dist/
+!ui/dist/index.html

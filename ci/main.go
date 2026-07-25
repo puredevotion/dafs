@@ -25,6 +25,7 @@
 //	dagger call audit          --source=..
 //	dagger call fuzz           --source=.. --seconds=60
 //	dagger call private-refs   --source=..
+//	dagger call ui-bundle      --source=..     # rebuild the UI, diff vs committed
 //	dagger call image          --source=..     # OCI container
 //
 // `image` returns a Container rather than pushing it. Pushing needs credentials
@@ -45,6 +46,10 @@ import (
 const (
 	rustImage    = "rust:1.97-bookworm"
 	nightlyImage = "rustlang/rust:nightly-bookworm"
+	// Frontend builds only. Node appears nowhere in the daemon's own build —
+	// the UI bundle is committed, so `cargo build` and `nix build` need no
+	// JavaScript toolchain at all. See UiBundle.
+	nodeImage = "node:22-alpine"
 	// Distroless: no shell, no package manager, and it carries CA certificates,
 	// which the daemon will need once it talks to peers.
 	runtimeImage = "gcr.io/distroless/cc-debian12:nonroot"
@@ -182,6 +187,49 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 		Stdout(ctx)
 }
 
+// UiBundle rebuilds the frontend and asserts the committed bundle matches.
+//
+// `ui/dist/index.html` is committed and embedded into the daemon with
+// include_str!, because the Rust build has to work with no network and an
+// `npm ci` in front of `cargo build` would break Hermetic. The risk that buys
+// is a committed artifact drifting from its source; this removes it by
+// rebuilding and diffing.
+//
+// Kept in lockstep with the `ui-bundle` job in the GitHub workflow.
+func (m *DafsCi) UiBundle(ctx context.Context, source *dagger.Directory) (string, error) {
+	// `npm ci` rather than `npm install`: it installs exactly the lockfile and
+	// fails if package.json and the lock disagree, which is what makes the
+	// rebuild reproducible rather than merely likely.
+	//
+	// The single-file assertion matters because the daemon serves one string
+	// and has no route for sibling assets — a build emitting a separate .js or
+	// .css would render a blank page in production while every Rust test passed.
+	script := `set -e
+npm ci --prefix ui
+npm run build --prefix ui
+count=$(find ui/dist -type f | wc -l)
+if [ "$count" -ne 1 ]; then
+  echo "ui/dist must contain exactly one file, found $count"
+  find ui/dist -type f
+  exit 1
+fi
+if ! git diff --quiet -- ui/dist; then
+  echo "ui/dist is out of date — run 'npm run build' in ui/ and commit the result"
+  git diff --stat -- ui/dist
+  exit 1
+fi
+echo "committed bundle matches a fresh build, and is a single file"`
+
+	return dag.Container().
+		From(nodeImage).
+		// git is needed for the diff below and is not in the base node image.
+		WithExec([]string{"apk", "add", "--no-cache", "git"}).
+		WithMountedDirectory("/src", source).
+		WithWorkdir("/src").
+		WithExec([]string{"sh", "-c", script}).
+		Stdout(ctx)
+}
+
 // Image builds the runtime container.
 //
 // Returns the Container rather than pushing it: a push needs registry
@@ -233,6 +281,7 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory) (string, e
 		{"rss-ceiling", func() error { _, e := m.RssCeiling(ctx, source); return e }},
 		{"audit", func() error { _, e := m.Audit(ctx, source); return e }},
 		{"private-refs", func() error { _, e := m.PrivateRefs(ctx, source); return e }},
+		{"ui-bundle", func() error { _, e := m.UiBundle(ctx, source); return e }},
 		{"fuzz", func() error { _, e := m.Fuzz(ctx, source, 30); return e }},
 	}
 

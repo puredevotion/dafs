@@ -123,14 +123,19 @@ impl AppState {
     }
 }
 
-/// The M00 UI shell, embedded in the binary.
+/// The timeline UI, embedded in the binary.
 ///
-/// Embedded rather than read from disk so the daemon is a single deployable
-/// artifact with no runtime asset path to get wrong. It is ~2 KiB; when M01
-/// brings a real frontend this becomes a decision about a static-file service,
-/// but embedding one small file now costs nothing and keeps deployment to
-/// "copy one binary".
-const UI_INDEX: &str = include_str!("../../../ui/index.html");
+/// This is `ui/dist/index.html` — the Vite build output, a single file with its
+/// JavaScript and CSS inlined. Embedding rather than serving from disk keeps the
+/// daemon one deployable artifact with no runtime asset path to get wrong.
+///
+/// `ui/dist/` is **committed**, and that is a deliberate trade. The Rust build
+/// must work with no network (CI vendors crates and builds `--offline`), so an
+/// `npm ci` cannot sit in front of `cargo build`. Committing the bundle keeps
+/// the Rust side hermetic and the Nix flake free of node entirely. CI rebuilds
+/// the frontend and fails if the committed copy differs, so the source and the
+/// artifact cannot drift — see `.github/workflows/ci.yml`.
+const UI_INDEX: &str = include_str!("../../../ui/dist/index.html");
 
 /// Build the router.
 pub fn router(state: AppState) -> Router {
@@ -485,11 +490,26 @@ mod tests {
             .expect("request");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
-        assert!(body.contains("<title>DAFS</title>"), "UI shell not served");
-        // The shell reads /version and /metrics; if those route names change,
-        // this catches the shell going stale rather than silently breaking.
-        assert!(body.contains("/version"), "shell should poll /version");
-        assert!(body.contains("dafs_resident_bytes"), "shell should read the RSS metric");
+        assert!(body.contains("<title>DAFS</title>"), "UI not served");
+
+        // The bundle must be self-contained: the daemon serves exactly this one
+        // string and has no route for sibling assets, so a build that emitted a
+        // separate .js or .css would render a blank page in production while
+        // every Rust test still passed.
+        assert!(
+            !body.contains("<script type=\"module\" src=\"/"),
+            "UI references an external script; the single-file build has regressed"
+        );
+        assert!(
+            !body.contains("rel=\"stylesheet\" href=\"/"),
+            "UI references an external stylesheet; the single-file build has regressed"
+        );
+
+        // The endpoints the page depends on. If a route is renamed, this fails
+        // rather than the UI silently going blank against a live daemon.
+        assert!(body.contains("/events"), "UI should read the timeline");
+        assert!(body.contains("/version"), "UI should poll /version");
+        assert!(body.contains("dafs_resident_bytes"), "UI should read the RSS metric");
     }
 
     /// Build a state with a fake store holding `n` events, newest id highest.

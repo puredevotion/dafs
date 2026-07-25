@@ -58,6 +58,58 @@ jobs:
         working-directory: fuzz
         run: cargo check
 
+  ui-bundle:
+    # `ui/dist/index.html` is committed and embedded into the daemon with
+    # include_str!, because the Rust build has to work with no network and an
+    # `npm ci` in front of `cargo build` would break that (see the `hermetic`
+    # job below).
+    #
+    # The risk that buys is a committed artifact drifting from its source. This
+    # job removes it: rebuild from ui/src and fail if the result differs from
+    # what is in the tree. So the bundle is reproducible, and a PR that edits
+    # the frontend without rebuilding cannot merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile and
+      # fails if package.json and the lock disagree, which is what makes the
+      # rebuild below reproducible rather than merely likely.
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Rebuild the bundle
+        working-directory: ui
+        run: npm run build
+
+      - name: Fail if the committed bundle is stale
+        run: |
+          if ! git diff --quiet -- ui/dist; then
+            echo "::error::ui/dist is out of date — run 'npm run build' in ui/ and commit the result"
+            git diff --stat -- ui/dist
+            exit 1
+          fi
+          echo "committed bundle matches a fresh build"
+
+      # The daemon serves exactly one file and has no route for sibling assets,
+      # so a build that emitted a separate .js or .css would render a blank page
+      # in production while every Rust test still passed.
+      - name: Assert the bundle is a single self-contained file
+        run: |
+          count=$(find ui/dist -type f | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::ui/dist must contain exactly one file, found $count"
+            find ui/dist -type f
+            exit 1
+          fi
+          echo "bundle is a single file"
+
   memory-budget:
     # The RSS ceiling from docs/memory-budget.md, asserted against the release
     # binary. Separate job because it needs a release build, which is slow and

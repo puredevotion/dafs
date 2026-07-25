@@ -23,15 +23,23 @@
             version = cargoToml.workspace.package.version;
 
             # Filtered rather than `self` so an unrelated doc or CI edit does not
-            # invalidate the derivation. `ui/` is included because dafs-api
-            # embeds index.html with include_str!.
+            # invalidate the derivation.
+            #
+            # Only `ui/dist` is included, not all of `ui/`: dafs-api embeds
+            # dist/index.html with include_str!, and pulling in the frontend
+            # sources, package.json, or a stray node_modules would invalidate
+            # the derivation on edits that cannot affect the built output.
+            #
+            # This is also why no node toolchain appears anywhere in this flake.
+            # The bundle is committed (see .gitignore and the ui-bundle CI job),
+            # so building the daemon needs nothing but Rust.
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
                 ./Cargo.toml
                 ./Cargo.lock
                 ./crates
-                ./ui
+                ./ui/dist
               ];
             };
             cargoLock.lockFile = ./Cargo.lock;
