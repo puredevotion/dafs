@@ -1,0 +1,17 @@
+[package]
+name = "dafs-store"
+description = "DAFS metadata store: SQLite schema, migrations, and connection tuning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

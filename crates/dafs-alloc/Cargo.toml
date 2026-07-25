@@ -1,0 +1,16 @@
+[package]
+name = "dafs-alloc"
+description = "Allocator selection and RSS measurement for the DAFS memory budget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true

@@ -1,0 +1,161 @@
+# The M00 CI gate. Every check here is a merge requirement.
+#
+# The load-bearing property is that all of this runs with no secrets, no private
+# DNS, and no access to any deployment environment. A tree that cannot pass here
+# cannot be built by anyone but its author, which would defeat the point of the
+# repository being public.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so advisories surface without waiting for a commit.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI without putting a blanket deny in the source, which
+  # would make local iteration painful.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-features
+
+      # Verify the fuzz target still compiles. It lives outside the workspace
+      # (cargo-fuzz needs its own profile), so `cargo test` does not cover it and
+      # it would rot silently.
+      - name: Check fuzz targets compile
+        working-directory: fuzz
+        run: cargo check
+
+  memory-budget:
+    # The RSS ceiling from docs/memory-budget.md, asserted against the release
+    # binary. Separate job because it needs a release build, which is slow and
+    # would hold up the fast feedback from `test`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release daemon
+        run: cargo build --release -p dafs-daemon
+
+      - name: Assert RSS ceilings
+        run: cargo test --release -p dafs-memtest -- --nocapture
+
+  hermetic:
+    # Proves the build needs no network. Dependencies are vendored first (which
+    # does use the network), then the build runs with --offline; anything still
+    # reaching out fails loudly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Vendor dependencies and point cargo at them
+        run: |
+          mkdir -p .cargo
+          cargo vendor --versioned-dirs vendor > .cargo/config.toml
+
+      - name: Build offline
+        run: cargo build --offline --all-targets
+
+      - name: Test offline
+        run: cargo test --offline
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: cargo-deny
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
+
+  fuzz-smoke:
+    # A short run per push. Not a campaign — it catches a target that has stopped
+    # working, and the occasional shallow crash. Long campaigns are a separate,
+    # scheduled concern once there is more surface to fuzz.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz the metadata store (60s)
+        run: cargo fuzz run migrations -- -max_total_time=60
+
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+
+  no-private-references:
+    # Structural counterpart to the hermetic build: catch internal hostnames and
+    # private address ranges before they are published. A denylist alone fails
+    # open, which is why the offline build is the real gate — this is the cheap
+    # fast check that catches the obvious cases.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for private references
+        run: |
+          set -uo pipefail
+          patterns='\.home\.arpa|\.internal\.arpa|192\.168\.|10\.(4[0-9]|[0-9])\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'
+          if grep -rInE "$patterns" \
+               --include='*.rs' --include='*.toml' --include='*.md' \
+               --include='*.yml' --include='*.nix' --include='*.html' \
+               . ; then
+            echo "::error::private reference found — see matches above"
+            exit 1
+          fi
+          echo "no private references found"
+
+  nix:
+    # The package the homelab (and any other Nix deployer) consumes as a flake
+    # input. Building it here means a broken flake fails on the PR that broke it,
+    # not on whoever next tries to deploy.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build the flake package
+        run: nix build .#dafs --print-build-logs
+      - name: Check the flake
+        run: nix flake check --print-build-logs

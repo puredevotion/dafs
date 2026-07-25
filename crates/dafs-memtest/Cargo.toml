@@ -1,0 +1,13 @@
+[package]
+name = "dafs-memtest"
+description = "RSS ceiling assertions for the release DAFS daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+tempfile.workspace = true

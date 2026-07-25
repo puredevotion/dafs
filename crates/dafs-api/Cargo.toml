@@ -1,0 +1,19 @@
+[package]
+name = "dafs-api"
+description = "DAFS HTTP API surface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dafs-alloc = { path = "../dafs-alloc" }
+axum.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { version = "0.5", features = ["util"] }

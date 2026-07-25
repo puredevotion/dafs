@@ -1,0 +1,101 @@
+{
+  description = "DAFS — distributed AI-native filesystem";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+
+        # Read version and name from Cargo.toml rather than duplicating them.
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      in
+      {
+        packages = rec {
+          default = dafs;
+
+          dafs = pkgs.rustPlatform.buildRustPackage {
+            pname = "dafs";
+            version = cargoToml.workspace.package.version;
+
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+
+            # rusqlite's `bundled` feature compiles SQLite from vendored C, so
+            # a C toolchain is needed but no system sqlite is. Bundling is
+            # deliberate: it pins the exact SQLite version the store's pragmas
+            # and STRICT tables were tested against, rather than inheriting
+            # whatever the host distribution ships.
+            nativeBuildInputs = [ pkgs.pkg-config ];
+
+            # jemalloc is built from source by tikv-jemalloc-sys.
+            buildInputs = [ ];
+
+            buildAndTestSubdir = null;
+            cargoBuildFlags = [ "-p" "dafs-daemon" ];
+
+            # The memtest crate spawns the release binary, which the Nix build
+            # sandbox has no network access to bind a socket for reliably, and
+            # `cargo test` here would run against the debug profile anyway. The
+            # ceiling assertions are a CI responsibility (see
+            # .github/workflows/ci.yml) rather than a build-time one.
+            doCheck = false;
+
+            meta = with pkgs.lib; {
+              description = "Distributed AI-native filesystem daemon";
+              homepage = "https://github.com/puredevotion/dafs";
+              license = licenses.mit;
+              mainProgram = "dafs";
+              platforms = platforms.linux;
+            };
+          };
+
+          # OCI image, for deployers that consume this as a container rather
+          # than a Nix package. streamLayeredImage rather than buildImage: it
+          # writes the tarball to stdout instead of into the store, so the
+          # image never occupies store space twice.
+          docker = pkgs.dockerTools.streamLayeredImage {
+            name = "dafs";
+            tag = cargoToml.workspace.package.version;
+            contents = [ dafs pkgs.cacert ];
+            config = {
+              Entrypoint = [ "${dafs}/bin/dafs" ];
+              # Bind all interfaces inside a container: the loopback default is
+              # right for a host process but would make the container
+              # unreachable. Exposing it is then the orchestrator's decision.
+              Env = [ "DAFS_LISTEN=0.0.0.0:7878" "DAFS_DATA_DIR=/data" ];
+              ExposedPorts."7878/tcp" = { };
+              Volumes."/data" = { };
+              User = "1000:1000";
+            };
+          };
+        };
+
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            rustc
+            rustfmt
+            clippy
+            cargo-audit
+            cargo-deny
+            cargo-llvm-cov
+            pkg-config
+          ];
+          # cargo-fuzz needs nightly, so it is deliberately absent here rather
+          # than pulling a second toolchain into every dev shell.
+          shellHook = ''
+            echo "dafs dev shell — cargo $(cargo --version | cut -d' ' -f2)"
+            echo "fuzzing needs nightly: cargo +nightly fuzz run migrations"
+          '';
+        };
+
+        checks = {
+          inherit (self.packages.${system}) dafs;
+        };
+      });
+}

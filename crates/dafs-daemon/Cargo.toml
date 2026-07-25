@@ -1,0 +1,24 @@
+[package]
+name = "dafs-daemon"
+description = "DAFS daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dafs"
+path = "src/main.rs"
+
+[dependencies]
+dafs-alloc = { path = "../dafs-alloc" }
+dafs-api = { path = "../dafs-api" }
+dafs-store = { path = "../dafs-store" }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
