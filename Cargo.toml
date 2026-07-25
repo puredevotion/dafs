@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/puredevotion/dafs"
+authors = ["Thijs Baars"]
+
+[workspace.dependencies]
+# Async runtime. Explicit feature list rather than "full": every extra feature
+# is resident code in a daemon with a 32 MB idle ceiling (docs/memory-budget.md).
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  "time",
+  "sync",
+  "fs",
+] }
+
+# HTTP surface.
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "json",
+  "tokio",
+  "query",
+] }
+tower-http = { version = "0.6", default-features = false, features = ["trace"] }
+
+# Metadata store. rusqlite over sqlx: no async layer, no connection pool, and a
+# far smaller dependency tree. The store is local-file, single-process, and
+# accessed from a blocking thread — an async SQL layer buys nothing here.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Allocator. See crates/dafs-alloc for why this is not optional.
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "env-filter",
+] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"
+
+[profile.release]
+# A filesystem daemon is long-lived: spend build time, not runtime.
+lto = "thin"
+codegen-units = 1
+
+# Deliberately NOT panic = "abort":
+#
+#  - It breaks libfuzzer's crash reporting, which needs to unwind to attribute a
+#    crash to an input.
+#  - A panic while serving one API request should not take the daemon — and a
+#    user's metadata database — down with it. Unwinding lets the request fail
+#    alone.
+#
+# The binary-size and speed win is not worth either of those for this workload.
+#
+# Also deliberately no `strip`: cargo applies profile settings to build-script
+# and proc-macro binaries too, and stripping those is a route to obscure
+# build-time failures. Strip the shipped binary in the packaging step instead,
+# where it only affects the artifact that is actually shipped.
+
+# The RSS assertion harness (crates/dafs-memtest) measures the release binary.
+# Debug builds have wildly different allocation behaviour and are not a valid
+# proxy for the ceilings in docs/memory-budget.md.
+[profile.bench]
+inherits = "release"

@@ -1,0 +1,25 @@
+[package]
+name = "dafs-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dafs-store = { path = "../crates/dafs-store" }
+tempfile = "3"
+
+# The fuzz crate is intentionally OUTSIDE the workspace: cargo-fuzz builds it
+# with its own sanitizer flags, and inheriting the workspace's release profile
+# (panic = "abort") breaks libfuzzer's crash reporting.
+[workspace]
+
+[[bin]]
+name = "migrations"
+path = "fuzz_targets/migrations.rs"
+test = false
+doc = false
+bench = false

@@ -4,9 +4,10 @@ A distributed, AI-native filesystem. Local-first, content-addressed,
 peer-to-peer, with files treated as part of a personal knowledge graph rather
 than isolated blobs in folders.
 
-> **Status: pre-alpha, empty.** No usable code yet. The roadmap below is real
-> and is being worked through in order, but nothing here does anything today.
-> Do not depend on this.
+> **Status: pre-alpha.** M00 (walking skeleton) is in: the daemon starts, migrates
+> its metadata store, serves a small HTTP API, and shuts down cleanly. It does not
+> yet watch, index, search, or sync anything — that starts at M01. Do not depend
+> on this.
 
 ## What it is meant to be
 
@@ -56,7 +57,7 @@ read-only)
 
 | | Milestone | What you get |
 |---|---|---|
-| M00 | Walking skeleton + CI | *(nothing — scaffolding and the test gate)* |
+| M00 | Walking skeleton + CI | *(nothing — scaffolding and the test gate)* ✅ |
 | M01 | Local timeline | "What did I work on today?" |
 | M02a | Deterministic metadata + browse | Filter and skim by real document properties |
 | M02b | Local LLM enrichment | Summaries, keywords, entities |
@@ -114,12 +115,73 @@ them.
 
 ## Building
 
-Nothing to build yet.
+```sh
+cargo build --release -p dafs-daemon
+./target/release/dafs             # serves http://127.0.0.1:7878
+```
 
-The tree is required to build and test **hermetically** — no secrets, no
-network, no private DNS. That's enforced in CI rather than left to good
-intentions: anything that can't build in a clean container can't be deployed by
-anyone but its author, which would defeat the point.
+Or with Nix:
+
+```sh
+nix build .#dafs                  # the daemon
+nix run .#docker                  # streams an OCI image to stdout
+nix develop                       # dev shell: clippy, audit, deny, llvm-cov
+```
+
+The API binds loopback by default and is unauthenticated. That pairing is
+deliberate — widening the bind address is a decision for whoever adds auth.
+
+### Layout
+
+| Crate | |
+|---|---|
+| `dafs-daemon` | the binary: startup ordering, signal handling, CLI |
+| `dafs-api` | HTTP surface and the embedded UI shell |
+| `dafs-store` | SQLite schema, migrations, connection tuning |
+| `dafs-alloc` | allocator selection and RSS measurement |
+| `dafs-memtest` | RSS ceiling assertions against the release binary |
+
+### CI runs in two places, deliberately
+
+The same suite runs as GitHub Actions (`.github/workflows/ci.yml`) and as a
+Dagger module (`ci/`). GitHub is free and unmetered for a public repo and gives
+every fork and external PR CI with no setup, so it stays as the gate. The Dagger
+module means none of that is load-bearing — the identical checks run on any
+machine with Dagger, so the project does not depend on one forge remaining free,
+available, or willing to host it.
+
+```sh
+cd ci
+dagger call check        --source=..              # everything, in parallel
+dagger call test         --source=..
+dagger call hermetic     --source=..              # builds with the network off
+dagger call rss-ceiling  --source=..              # release binary, real RSS
+dagger call fuzz         --source=.. --seconds=60
+dagger call image        --source=..              # OCI container
+```
+
+A disagreement between the two is a real environment-dependency bug worth
+knowing about. Keep them in step: a check added to one belongs in the other.
+
+Release builds, artifacts, SBOM, and provenance are the one genuinely
+GitHub-specific part, in `.github/workflows/release.yml`, on version tags only.
+
+### Hermetic builds are a requirement, not an aspiration
+
+The tree must build and test with no secrets, no network, and no private DNS.
+CI enforces it by vendoring dependencies and then building with `--offline`, so
+anything still reaching out fails the build. Code that can't build in a clean
+container can't be deployed by anyone but its author, which would defeat the
+point of this being public.
+
+### Memory
+
+The daemon's idle RSS ceiling is **32 MiB**, asserted in CI against the release
+binary from M00 onward, and exported as `dafs_resident_bytes` on `/metrics` so
+it is observable in a running deployment rather than only in tests. Current
+measured idle: **~6 MiB**. See [`docs/memory-budget.md`](docs/memory-budget.md)
+for the full budget, the allocator tuning it depends on, and which technique is
+due at which milestone.
 
 ## Contributing
 

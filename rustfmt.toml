@@ -1,0 +1,5 @@
+# Wider than the 100 default: this codebase carries dense explanatory comments,
+# and 100 columns forces awkward wrapping in signatures that are already clear.
+max_width = 100
+use_small_heuristics = "Max"
+edition = "2024"
