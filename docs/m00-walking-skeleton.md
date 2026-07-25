@@ -150,9 +150,10 @@ part that silently passes when wrong:
 
 ## Next: M01
 
-Local timeline — the first milestone with user value (*"what did I work on
-today?"*). Its memory requirements are the binding constraint: streaming with
-bounded channels, mmap on the read path, and **path-component interning**, which
-must land in M01 because M07's graph will depend on path IDs and retrofitting it
-afterwards is far more invasive. See
+**Delivered** — see [`docs/m01-local-timeline.md`](m01-local-timeline.md).
+
+Local timeline: the first milestone with user value (*"what did I work on
+today?"*). Its memory requirements were the binding constraint, and
+path-component interning landed there as planned, because M07's graph will
+depend on path IDs and retrofitting it afterwards is far more invasive. See
 [`docs/memory-budget.md`](memory-budget.md#m01--scan-and-event-path).

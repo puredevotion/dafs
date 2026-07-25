@@ -26,6 +26,7 @@
 //	dagger call fuzz           --source=.. --seconds=60
 //	dagger call private-refs   --source=..
 //	dagger call ui-bundle      --source=..     # rebuild the UI, diff vs committed
+//	dagger call dast           --source=..     # scanners against a live daemon
 //	dagger call image          --source=..     # OCI container
 //
 // `image` returns a Container rather than pushing it. Pushing needs credentials
@@ -50,6 +51,9 @@ const (
 	// the UI bundle is committed, so `cargo build` and `nix build` need no
 	// JavaScript toolchain at all. See UiBundle.
 	nodeImage = "node:22-alpine"
+	// Dynamic scanning. ZAP's baseline is driven from the GitHub workflow,
+	// which has a maintained action for it; nuclei runs in both places.
+	nucleiImage = "projectdiscovery/nuclei:latest"
 	// Distroless: no shell, no package manager, and it carries CA certificates,
 	// which the daemon will need once it talks to peers.
 	runtimeImage = "gcr.io/distroless/cc-debian12:nonroot"
@@ -137,7 +141,22 @@ func (m *DafsCi) Audit(ctx context.Context, source *dagger.Directory) (string, e
 		Stdout(ctx)
 }
 
-// Fuzz runs the metadata-store fuzz target for `seconds`.
+// fuzzTargets is every target in fuzz/Cargo.toml.
+//
+// Listed here rather than discovered, so adding a target to the fuzz crate
+// without wiring it into CI is a visible omission in this file rather than a
+// target that silently never runs. Kept in lockstep with the fuzz-smoke job in
+// the GitHub workflow.
+var fuzzTargets = []string{
+	// The store against a corrupted database file.
+	"migrations",
+	// Path interning against arbitrary filename bytes. On Unix any sequence
+	// but NUL and `/` is a legal component, so invalid UTF-8 and
+	// traversal-shaped names arrive from simply scanning a directory.
+	"paths",
+}
+
+// Fuzz runs every fuzz target for `seconds` each.
 //
 // Nightly, because cargo-fuzz needs it. A short run per push is not a campaign;
 // it catches a target that has stopped building and the occasional shallow
@@ -146,11 +165,16 @@ func (m *DafsCi) Fuzz(ctx context.Context, source *dagger.Directory, seconds int
 	if seconds <= 0 {
 		seconds = 60
 	}
-	return m.rustBase(source, nightlyImage).
-		WithExec([]string{"cargo", "install", "cargo-fuzz", "--locked"}).
-		WithExec([]string{"cargo", "fuzz", "run", "migrations", "--",
-			fmt.Sprintf("-max_total_time=%d", seconds)}).
-		Stdout(ctx)
+
+	container := m.rustBase(source, nightlyImage).
+		WithExec([]string{"cargo", "install", "cargo-fuzz", "--locked"})
+
+	for _, target := range fuzzTargets {
+		container = container.WithExec([]string{"cargo", "fuzz", "run", target, "--",
+			fmt.Sprintf("-max_total_time=%d", seconds)})
+	}
+
+	return container.Stdout(ctx)
 }
 
 // PrivateRefs scans for internal hostnames and private address ranges.
@@ -184,6 +208,47 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 		WithMountedDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "-c", script}).
+		Stdout(ctx)
+}
+
+// Dast runs dynamic scanners against a live daemon.
+//
+// Scoped to milestones that actually have an HTTP surface — three in the whole
+// roadmap — rather than listed against every one. M01's timeline API is the
+// first, so this exists from here and not before.
+//
+// The daemon binds loopback and is unauthenticated by design, so "no auth" is
+// not the finding this looks for. It is the accidental kind: a reflected value,
+// a header leaking a path, an unbounded request body. The M01 pass found the
+// last of those — a 2 MB log-filter payload accepted with a 200.
+//
+// Kept in lockstep with the `dast` job in the GitHub workflow.
+func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, error) {
+	daemon := m.rustBase(source, rustImage).
+		WithExec([]string{"cargo", "build", "--release", "-p", "dafs-daemon"}).
+		WithExec([]string{"cp", "/src/target/release/dafs", "/dafs"})
+
+	// A corpus, so the scan has something to find. A scanner pointed at an
+	// empty timeline passes trivially, which is worse than not running it.
+	service := dag.Container().
+		From(runtimeImage).
+		WithFile("/dafs", daemon.File("/dafs")).
+		WithEnvVariable("DAFS_LISTEN", "0.0.0.0:7878").
+		WithEnvVariable("DAFS_DATA_DIR", "/tmp/data").
+		WithEnvVariable("DAFS_WATCH", "/tmp/corpus").
+		WithDirectory("/tmp/corpus", dag.Directory().
+			WithNewFile("note.md", "hello").
+			WithNewFile("docs/readme.txt", "world")).
+		WithExposedPort(7878).
+		AsService()
+
+	return dag.Container().
+		From(nucleiImage).
+		WithServiceBinding("dafs", service).
+		// Fail the check only on findings that are actually actionable;
+		// informational output on an unauthenticated local API is noise.
+		WithExec([]string{"nuclei", "-target", "http://dafs:7878",
+			"-severity", "critical,high,medium"}).
 		Stdout(ctx)
 }
 
@@ -282,6 +347,7 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory) (string, e
 		{"audit", func() error { _, e := m.Audit(ctx, source); return e }},
 		{"private-refs", func() error { _, e := m.PrivateRefs(ctx, source); return e }},
 		{"ui-bundle", func() error { _, e := m.UiBundle(ctx, source); return e }},
+		{"dast", func() error { _, e := m.Dast(ctx, source); return e }},
 		{"fuzz", func() error { _, e := m.Fuzz(ctx, source, 30); return e }},
 	}
 

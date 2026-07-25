@@ -4,10 +4,11 @@ A distributed, AI-native filesystem. Local-first, content-addressed,
 peer-to-peer, with files treated as part of a personal knowledge graph rather
 than isolated blobs in folders.
 
-> **Status: pre-alpha.** M00 (walking skeleton) is in: the daemon starts, migrates
-> its metadata store, serves a small HTTP API, and shuts down cleanly. It does not
-> yet watch, index, search, or sync anything — that starts at M01. Do not depend
-> on this.
+> **Status: pre-alpha.** M01 (local timeline) is in: point the daemon at a
+> directory and it records what changes there, served as a timeline you can read
+> in a browser. It is strictly read-only — it never modifies the files it
+> observes. It does not yet extract metadata, search, or sync anything. Do not
+> depend on this.
 
 ## What it is meant to be
 
@@ -58,7 +59,7 @@ read-only)
 | | Milestone | What you get |
 |---|---|---|
 | M00 | Walking skeleton + CI | *(nothing — scaffolding and the test gate)* ✅ |
-| M01 | Local timeline | "What did I work on today?" |
+| M01 | Local timeline | "What did I work on today?" ✅ |
 | M02a | Deterministic metadata + browse | Filter and skim by real document properties |
 | M02b | Local LLM enrichment | Summaries, keywords, entities |
 | M03 | Semantic search | Find things without remembering filenames |
@@ -117,7 +118,21 @@ them.
 
 ```sh
 cargo build --release -p dafs-daemon
-./target/release/dafs             # serves http://127.0.0.1:7878
+./target/release/dafs --watch ~/Documents    # observe a directory
+open http://127.0.0.1:7878                   # read the timeline
+```
+
+With no `--watch` it starts, serves an empty timeline, and observes nothing —
+a daemon that began indexing a home directory nobody pointed it at would be a
+surprise.
+
+The frontend lives in `ui/` and is built with Vite. Its output
+(`ui/dist/index.html`, one self-contained file) is **committed**, because the
+Rust build has to work with no network and an `npm ci` in front of `cargo build`
+would break that. CI rebuilds it and fails if the committed copy is stale.
+
+```sh
+cd ui && npm ci && npm run build    # after changing anything under ui/src
 ```
 
 Or with Nix:
@@ -135,9 +150,10 @@ deliberate — widening the bind address is a decision for whoever adds auth.
 
 | Crate | |
 |---|---|
-| `dafs-daemon` | the binary: startup ordering, signal handling, CLI |
-| `dafs-api` | HTTP surface and the embedded UI shell |
-| `dafs-store` | SQLite schema, migrations, connection tuning |
+| `dafs-daemon` | the binary: startup ordering, signal handling, CLI, the observer thread |
+| `dafs-api` | HTTP surface and the embedded UI |
+| `dafs-scan` | filesystem observer: initial scan and live watch |
+| `dafs-store` | SQLite schema, migrations, path interning, the event log |
 | `dafs-alloc` | allocator selection and RSS measurement |
 | `dafs-memtest` | RSS ceiling assertions against the release binary |
 
@@ -178,10 +194,16 @@ point of this being public.
 
 The daemon's idle RSS ceiling is **32 MiB**, asserted in CI against the release
 binary from M00 onward, and exported as `dafs_resident_bytes` on `/metrics` so
-it is observable in a running deployment rather than only in tests. Current
-measured idle: **~6 MiB**. See [`docs/memory-budget.md`](docs/memory-budget.md)
-for the full budget, the allocator tuning it depends on, and which technique is
-due at which milestone.
+it is observable in a running deployment rather than only in tests.
+
+From M01 the scan has its own requirement, and it is the stronger one: peak
+memory must be **independent of corpus size**, not merely under a number on one
+corpus — a scan that accumulates per-file state passes a single-size check on a
+small tree and fails on a real one. Measured at 9.35 MiB for 64k files and
+9.36 MiB for 128k: 1.00x growth for a 2x corpus.
+
+See [`docs/memory-budget.md`](docs/memory-budget.md) for the full budget, the
+allocator tuning it depends on, and which technique is due at which milestone.
 
 ## Contributing
 

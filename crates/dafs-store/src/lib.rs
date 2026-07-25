@@ -123,9 +123,21 @@ const MIGRATIONS: &[Migration] = &[
             -- Set when the entry is observed gone. Rows are tombstoned rather
             -- than deleted so events referencing them keep resolving, and so a
             -- delete is itself a fact the timeline can show.
-            deleted_at   INTEGER,
-            UNIQUE (parent_id, component_id)
+            deleted_at   INTEGER
         ) STRICT;
+
+        -- A directory cannot hold two entries with the same name — a filesystem
+        -- invariant worth having the database enforce rather than trusting the
+        -- scanner to maintain.
+        --
+        -- Partial, on live rows only. A tombstone must not keep occupying the
+        -- slot: a file deleted and later recreated, or replaced by a rename
+        -- over the top of it, would otherwise collide with its own corpse. A
+        -- plain table-level UNIQUE cannot express that, which is why this is an
+        -- index rather than a column constraint.
+        CREATE UNIQUE INDEX files_live_entry
+            ON files(parent_id, component_id)
+            WHERE deleted_at IS NULL;
 
         CREATE INDEX files_parent ON files(parent_id);
 

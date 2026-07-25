@@ -18,6 +18,23 @@
 //! [`DEBOUNCE`] is the window; it is deliberately short enough that the timeline
 //! still feels live.
 //!
+//! # Rename correlation
+//!
+//! A rename arrives as two events — the path it left and the path it arrived at
+//! — and pairing them wrongly is worse than not pairing them at all, because it
+//! merges two files' histories into one. So this does not guess.
+//!
+//! inotify assigns both halves a **cookie**, surfaced by `notify` as an event
+//! tracker id, and that pairing comes from the kernel rather than from
+//! heuristics about timing or size. `RenameMode::Both` carries both paths in one
+//! event; `From`/`To` arrive separately and are matched on the tracker id.
+//!
+//! An unmatched half is not a rename. A file moved *out* of a watched tree has a
+//! `From` with no `To`, and a file moved *in* has the reverse — those are a
+//! delete and a create, which is exactly what they are from the tree's point of
+//! view. [`PENDING_RENAME_TTL`] bounds how long an unmatched half waits before
+//! being treated that way.
+//!
 //! # Overflow
 //!
 //! The kernel's event queue is finite. Under a large burst — extracting an
@@ -32,10 +49,19 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind as NotifyKind, RecursiveMode, Watcher};
 
 /// How long a path stays quiet before its pending change is recorded.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// How long an unmatched half of a rename waits for its partner.
+///
+/// The two halves are emitted back to back by the kernel, so this only has to
+/// cover scheduling jitter. Longer would delay reporting a genuine
+/// move-out-of-tree as the deletion it is; shorter risks splitting a real
+/// rename into a delete and a create under load.
+pub const PENDING_RENAME_TTL: Duration = Duration::from_millis(1_000);
 
 /// What the watcher decided happened, after coalescing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +71,12 @@ pub enum Change {
     /// it has just seen was already known.
     Touched(PathBuf),
     Removed(PathBuf),
+    /// A path moved. Both endpoints are known, so this is a real rename rather
+    /// than an inferred one — see the module docs on rename correlation.
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+    },
     /// The kernel queue overflowed and events were lost. The only safe response
     /// is a rescan; see the module docs.
     Overflowed,
@@ -64,7 +96,19 @@ pub struct Watch {
     _watcher: notify::RecommendedWatcher,
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
     pending: HashMap<PathBuf, Pending>,
+    /// Halves of a rename waiting for their partner, keyed by the kernel's
+    /// tracker id. See the module docs on rename correlation.
+    pending_renames: HashMap<usize, PendingRename>,
     overflowed: bool,
+}
+
+/// One half of a rename, waiting to be paired.
+struct PendingRename {
+    path: PathBuf,
+    /// Which half this is. A `From` with no partner is a move out of the tree
+    /// (a deletion); a `To` with no partner is a move in (a creation).
+    is_source: bool,
+    seen: Instant,
 }
 
 impl Watch {
@@ -82,7 +126,13 @@ impl Watch {
             watcher.watch(root, RecursiveMode::Recursive)?;
         }
 
-        Ok(Self { _watcher: watcher, rx, pending: HashMap::new(), overflowed: false })
+        Ok(Self {
+            _watcher: watcher,
+            rx,
+            pending: HashMap::new(),
+            pending_renames: HashMap::new(),
+            overflowed: false,
+        })
     }
 
     /// Collect changes whose debounce window has expired.
@@ -126,6 +176,14 @@ impl Watch {
 
         let now = Instant::now();
 
+        // Renames are handled separately: they carry two paths that must stay
+        // associated, which the per-path pending map cannot express.
+        if let NotifyKind::Modify(ModifyKind::Name(mode)) = event.kind
+            && self.absorb_rename(mode, &event, now)
+        {
+            return;
+        }
+
         for path in event.paths {
             let change = match event.kind {
                 NotifyKind::Remove(_) => Change::Removed(path.clone()),
@@ -142,11 +200,103 @@ impl Watch {
         }
     }
 
+    /// Fold a rename event into the pending set.
+    ///
+    /// Returns `false` when the event could not be interpreted as a rename, so
+    /// the caller falls back to treating it as an ordinary change — better a
+    /// delete-plus-create than a dropped event.
+    fn absorb_rename(&mut self, mode: RenameMode, event: &notify::Event, now: Instant) -> bool {
+        match mode {
+            // Both endpoints in one event: no correlation needed.
+            RenameMode::Both if event.paths.len() >= 2 => {
+                let from = event.paths[0].clone();
+                let to = event.paths[1].clone();
+                self.emit_rename(from, to, now);
+                true
+            }
+
+            RenameMode::From | RenameMode::To => {
+                let Some(path) = event.paths.first().cloned() else {
+                    return false;
+                };
+                // Without a tracker id there is nothing to pair on, and pairing
+                // by guesswork could merge two unrelated files' histories.
+                // Falling back to delete-plus-create is the honest answer.
+                let Some(tracker) = event.tracker() else {
+                    return false;
+                };
+                let is_source = mode == RenameMode::From;
+
+                match self.pending_renames.remove(&tracker) {
+                    // The partner arrived: pair them, oldest half first.
+                    Some(partner) if partner.is_source != is_source => {
+                        let (from, to) =
+                            if is_source { (path, partner.path) } else { (partner.path, path) };
+                        self.emit_rename(from, to, now);
+                    }
+                    // Two halves of the same direction under one tracker id
+                    // should not happen; keep the newer and let the older
+                    // expire rather than pairing something nonsensical.
+                    Some(_) | None => {
+                        self.pending_renames
+                            .insert(tracker, PendingRename { path, is_source, seen: now });
+                    }
+                }
+                true
+            }
+
+            // `Any`/`Other`, or a `Both` without two paths: not enough to
+            // correlate on.
+            _ => false,
+        }
+    }
+
+    fn emit_rename(&mut self, from: PathBuf, to: PathBuf, now: Instant) {
+        // Any pending change against either endpoint is superseded: the file's
+        // new identity is what the timeline should show.
+        self.pending.remove(&from);
+        self.pending
+            .insert(to.clone(), Pending { change: Change::Renamed { from, to }, last_seen: now });
+    }
+
+    /// Turn rename halves that never found a partner into plain changes.
+    ///
+    /// A `From` with no `To` is a file moved out of the watched tree, which is a
+    /// deletion as far as this tree is concerned; a `To` with no `From` is a
+    /// file moved in, which is a creation.
+    fn expire_pending_renames(&mut self, now: Instant) {
+        let expired: Vec<usize> = self
+            .pending_renames
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.seen) >= PENDING_RENAME_TTL)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in expired {
+            let Some(half) = self.pending_renames.remove(&id) else { continue };
+            let change = if half.is_source {
+                Change::Removed(half.path.clone())
+            } else {
+                Change::Touched(half.path.clone())
+            };
+            tracing::trace!(
+                path = %half.path.display(),
+                moved_out = half.is_source,
+                "rename half found no partner; treating it as a plain change"
+            );
+            self.pending.insert(half.path, Pending { change, last_seen: now });
+        }
+    }
+
     /// Remove and return changes that have been quiet for longer than the
     /// debounce window.
     fn take_expired(&mut self) -> Vec<Change> {
         let now = Instant::now();
         let mut out = Vec::new();
+
+        // Before draining: a rename half whose partner never arrived becomes an
+        // ordinary change, and must go through the same debounce as any other.
+        self.expire_pending_renames(now);
 
         if std::mem::take(&mut self.overflowed) {
             // First, so a caller that stops at the first overflow still rescans
@@ -256,6 +406,84 @@ mod tests {
             .filter(|c| matches!(c, Change::Touched(p) if p.ends_with("busy.txt")))
             .count();
         assert_eq!(touches, 1, "ten writes should coalesce to one change, got {changes:?}");
+    }
+
+    /// A real rename inside a watched tree must arrive as one `Renamed` with
+    /// both endpoints — not as a delete plus a create, which would split the
+    /// file's history in two.
+    #[test]
+    fn a_rename_within_the_tree_is_reported_as_one_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let before = dir.path().join("before.txt");
+        std::fs::write(&before, "contents").expect("write");
+
+        let mut watch = Watch::new(&[dir.path().to_path_buf()]).expect("watch");
+
+        // Drain the creation above so it does not confuse the assertion.
+        let settle = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < settle {
+            watch.poll(Duration::from_millis(200));
+        }
+
+        let after = dir.path().join("after.txt");
+        std::fs::rename(&before, &after).expect("rename");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut changes = Vec::new();
+        while Instant::now() < deadline && changes.is_empty() {
+            changes = watch.poll(Duration::from_millis(200));
+        }
+
+        let renames: Vec<_> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Renamed { from, to } => Some((from, to)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(renames.len(), 1, "expected exactly one rename, got {changes:?}");
+        assert!(renames[0].0.ends_with("before.txt"), "wrong source: {:?}", renames[0].0);
+        assert!(renames[0].1.ends_with("after.txt"), "wrong destination: {:?}", renames[0].1);
+
+        // And no stray delete or create for either endpoint, which is the
+        // failure mode this whole mechanism exists to avoid.
+        assert!(
+            !changes.iter().any(|c| matches!(c, Change::Removed(_))),
+            "a rename also produced a deletion: {changes:?}"
+        );
+    }
+
+    /// A half with no partner must not wait forever. Moving a file *out* of the
+    /// tree produces a `From` that never pairs, and it has to surface as the
+    /// deletion it effectively is.
+    #[test]
+    fn an_unpaired_rename_half_expires_into_a_plain_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut watch = Watch::new(&[dir.path().to_path_buf()]).expect("watch");
+
+        // Inject a half directly: producing a genuinely unpaired one depends on
+        // moving across a filesystem boundary, which is not portable in a test.
+        // What matters is that an unmatched half converts rather than leaking.
+        watch.pending_renames.insert(
+            42,
+            PendingRename {
+                path: dir.path().join("gone.txt"),
+                is_source: true,
+                seen: Instant::now() - PENDING_RENAME_TTL - Duration::from_millis(50),
+            },
+        );
+
+        // First poll expires it into `pending`; the debounce then has to lapse.
+        watch.poll(Duration::from_millis(10));
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(100));
+        let changes = watch.poll(Duration::from_millis(10));
+
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::Removed(p) if p.ends_with("gone.txt"))),
+            "an unpaired rename source should become a deletion, got {changes:?}"
+        );
+        assert_eq!(watch.pending_renames.len(), 0, "the expired half was not cleaned up");
     }
 
     #[test]

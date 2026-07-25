@@ -288,6 +288,24 @@ fn apply_change(
         Change::Removed(path) => {
             dafs_scan::record_removal(conn, interner, roots, &path)?;
         }
+        // A rename into or out of an excluded directory is not a rename as far
+        // as the timeline is concerned — it is an arrival or a departure, and
+        // recording it as a move would show a path the user asked not to index.
+        Change::Renamed { from, to } => {
+            let from_excluded = dafs_scan::watch::is_excluded(&from, &options.skip_dirs);
+            let to_excluded = dafs_scan::watch::is_excluded(&to, &options.skip_dirs);
+
+            match (from_excluded, to_excluded) {
+                (true, true) => {
+                    tracing::trace!("ignoring rename entirely within excluded paths");
+                }
+                (true, false) => dafs_scan::record_path(conn, interner, roots, &to)?,
+                (false, true) => dafs_scan::record_removal(conn, interner, roots, &from)?,
+                (false, false) => {
+                    dafs_scan::record_rename(conn, interner, roots, &from, &to)?;
+                }
+            }
+        }
     }
 
     Ok(())

@@ -452,6 +452,139 @@ pub fn record_path(
     Ok(())
 }
 
+/// Record that a path moved.
+///
+/// The file keeps its row and its id, so its history survives the move — which
+/// is the whole point of detecting renames rather than recording a delete and a
+/// create. The event carries where it came from, so the timeline can show the
+/// old name.
+///
+/// Falls back to recording the destination as a plain change when the source
+/// was never known (a move in from outside the watched tree, or from a
+/// directory the scan skipped).
+pub fn record_rename(
+    conn: &Connection,
+    interner: &mut Interner,
+    roots: &[PathBuf],
+    from: &Path,
+    to: &Path,
+) -> Result<(), ScanError> {
+    let Some(to_root) = owning_root(roots, to) else {
+        // Moved out of every watched tree: from this tree's point of view the
+        // file is gone.
+        return record_removal(conn, interner, roots, from);
+    };
+
+    // Resolve the source row without creating anything — a rename of something
+    // never recorded is just an arrival.
+    let source = lookup_file(conn, interner, roots, from)?;
+
+    let Some((file_id, old_parent_id, old_component_id)) = source else {
+        return record_path(conn, interner, roots, to);
+    };
+
+    // Re-parent the existing row rather than inserting a new one. This is the
+    // step that preserves history: every event already pointing at `file_id`
+    // stays attached to the file under its new name.
+    let to_root_id = ensure_dir_chain(conn, interner, to_root)?;
+    let relative = to.strip_prefix(to_root).unwrap_or(to);
+    let new_parent_id = match relative.parent() {
+        Some(p) if !p.as_os_str().is_empty() => {
+            ensure_relative_dirs(conn, interner, to_root_id, p)?
+        }
+        _ => to_root_id,
+    };
+
+    let Some(name) = to.file_name() else {
+        return Ok(());
+    };
+    let name = name.to_string_lossy();
+
+    let is_dir = std::fs::symlink_metadata(to).map(|m| m.is_dir()).unwrap_or(false);
+    let new_component_id = if is_dir {
+        interner.intern_dir(conn, &name)?
+    } else {
+        interner.intern_leaf(conn, &name)?
+    };
+
+    // A row may already exist at the destination if something was overwritten.
+    // Tombstone it first: two live rows cannot share (parent_id, component_id),
+    // and the file being replaced is genuinely gone.
+    if let Some((displaced, _, _)) = lookup_file(conn, interner, roots, to)?
+        && displaced != file_id
+    {
+        conn.execute(
+            "UPDATE files SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![displaced, now_unix_ms()],
+        )?;
+        dafs_store::events::append(conn, &NewEvent::now(displaced, EventKind::Deleted))?;
+    }
+
+    conn.execute(
+        "UPDATE files SET parent_id = ?2, component_id = ?3, deleted_at = NULL WHERE id = ?1",
+        rusqlite::params![file_id, new_parent_id, new_component_id],
+    )?;
+
+    dafs_store::events::append(
+        conn,
+        &NewEvent {
+            file_id,
+            kind: EventKind::Renamed,
+            at_unix_ms: now_unix_ms(),
+            size_bytes: std::fs::symlink_metadata(to).ok().map(|m| m.len() as i64),
+            prev_parent_id: Some(old_parent_id),
+            prev_component_id: Some(old_component_id),
+        },
+    )?;
+
+    tracing::debug!(from = %from.display(), to = %to.display(), "recorded rename");
+
+    Ok(())
+}
+
+/// Find an existing `files` row for a path, without creating anything.
+///
+/// Returns the row id along with its current parent and component, which a
+/// rename needs in order to record where the file came from.
+#[allow(clippy::type_complexity)]
+fn lookup_file(
+    conn: &Connection,
+    interner: &mut Interner,
+    roots: &[PathBuf],
+    path: &Path,
+) -> Result<Option<(FileId, FileId, i64)>, ScanError> {
+    use rusqlite::OptionalExtension as _;
+
+    let Some(root) = owning_root(roots, path) else {
+        return Ok(None);
+    };
+    let Some(name) = path.file_name() else {
+        return Ok(None);
+    };
+    let Some(component_id) = lookup_component(conn, &name.to_string_lossy())? else {
+        return Ok(None);
+    };
+
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let Some(parent_id) = lookup_parent(conn, interner, root, relative)? else {
+        return Ok(None);
+    };
+
+    Ok(conn
+        .query_row(
+            // Live row first: the uniqueness index is partial, so a location
+            // can hold one live row plus tombstones of files previously there.
+            "SELECT id FROM files
+              WHERE parent_id IS ?1 AND component_id = ?2
+              ORDER BY deleted_at IS NULL DESC, deleted_at DESC
+              LIMIT 1",
+            rusqlite::params![parent_id, component_id],
+            |r| r.get::<_, FileId>(0),
+        )
+        .optional()?
+        .map(|id| (id, parent_id, component_id)))
+}
+
 /// Record that a path is gone.
 ///
 /// Tombstones rather than deletes: events referencing the row must keep
@@ -554,7 +687,12 @@ fn lookup_parent(
 
         let next: Option<FileId> = conn
             .query_row(
-                "SELECT id FROM files WHERE parent_id IS ?1 AND component_id = ?2",
+                // Live row first: the uniqueness index is partial, so a location
+                // can hold one live row plus tombstones of files previously there.
+                "SELECT id FROM files
+              WHERE parent_id IS ?1 AND component_id = ?2
+              ORDER BY deleted_at IS NULL DESC, deleted_at DESC
+              LIMIT 1",
                 rusqlite::params![current, component_id],
                 |r| r.get(0),
             )
@@ -900,6 +1038,189 @@ mod tests {
         let after = snapshot(dir.path());
 
         assert_eq!(before, after, "the scan modified the tree it was observing");
+    }
+
+    /// The point of detecting a rename rather than recording delete+create:
+    /// the file keeps its id, so everything already known about it survives.
+    #[test]
+    fn a_rename_preserves_the_file_and_its_history() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+
+        let before = write(dir.path(), "before.txt", "contents");
+        scan(&conn, &mut i, dir.path(), &ScanOptions::default()).expect("scan");
+
+        let original_id: i64 = conn
+            .query_row("SELECT file_id FROM events LIMIT 1", [], |r| r.get(0))
+            .expect("original file id");
+
+        let after = dir.path().join("after.txt");
+        std::fs::rename(&before, &after).expect("rename");
+        record_rename(&conn, &mut i, &roots, &before, &after).expect("record rename");
+
+        // Same row, so the created event still belongs to this file.
+        let events: Vec<(i64, String)> = conn
+            .prepare("SELECT file_id, kind FROM events ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+
+        assert_eq!(events.len(), 2, "expected a create and a rename, got {events:?}");
+        assert_eq!(events[1].1, "renamed");
+        assert!(
+            events.iter().all(|(id, _)| *id == original_id),
+            "the rename created a new file row, losing history: {events:?}"
+        );
+
+        // And the timeline shows both names.
+        let entries = timeline(&conn, &TimelineQuery::default()).expect("timeline");
+        assert!(entries[0].path.ends_with("/after.txt"), "unexpected path {}", entries[0].path);
+        assert!(
+            entries[0].previous_path.as_deref().is_some_and(|p| p.ends_with("/before.txt")),
+            "rename did not record where the file came from: {:?}",
+            entries[0].previous_path
+        );
+    }
+
+    /// A rename onto an existing file destroys that file. It must be tombstoned
+    /// rather than left as a second live row sharing the same location.
+    #[test]
+    fn a_rename_over_an_existing_file_tombstones_it() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+
+        let source = write(dir.path(), "source.txt", "new contents");
+        let victim = write(dir.path(), "victim.txt", "about to be replaced");
+        scan(&conn, &mut i, dir.path(), &ScanOptions::default()).expect("scan");
+
+        let victim_id = {
+            let component: i64 = conn
+                .query_row("SELECT id FROM path_components WHERE name = 'victim.txt'", [], |r| {
+                    r.get(0)
+                })
+                .expect("victim component");
+            conn.query_row("SELECT id FROM files WHERE component_id = ?1", [component], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("victim row")
+        };
+
+        std::fs::rename(&source, &victim).expect("rename over");
+        record_rename(&conn, &mut i, &roots, &source, &victim).expect("record rename");
+
+        let deleted: Option<i64> = conn
+            .query_row("SELECT deleted_at FROM files WHERE id = ?1", [victim_id], |r| r.get(0))
+            .expect("victim row still present");
+        assert!(deleted.is_some(), "the overwritten file was not tombstoned");
+
+        // Exactly one live row at that location, or the unique constraint would
+        // have been violated.
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files f
+                   JOIN path_components c ON c.id = f.component_id
+                  WHERE c.name = 'victim.txt' AND f.deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(live, 1, "expected exactly one live row at the destination");
+    }
+
+    /// A file moved in from outside the watched tree was never known, so it is
+    /// an arrival rather than a move.
+    #[test]
+    fn a_rename_from_an_unknown_source_is_recorded_as_a_creation() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+
+        // Never scanned, so the store has no row for it.
+        let outside = dir.path().join("never-seen.txt");
+        let inside = dir.path().join("arrived.txt");
+        std::fs::write(&inside, "hello").expect("write");
+
+        record_rename(&conn, &mut i, &roots, &outside, &inside).expect("record rename");
+
+        let entries = timeline(&conn, &TimelineQuery::default()).expect("timeline");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].kind,
+            EventKind::Created,
+            "expected a creation, got {:?}",
+            entries[0]
+        );
+        assert!(entries[0].path.ends_with("/arrived.txt"));
+    }
+
+    /// Moving a file out of every watched root is a deletion from the tree's
+    /// point of view.
+    #[test]
+    fn a_rename_out_of_every_root_is_recorded_as_a_deletion() {
+        let (conn, mut i, dir) = setup();
+        let watched = dir.path().join("watched");
+        std::fs::create_dir_all(&watched).expect("mkdir");
+        let roots = vec![watched.clone()];
+
+        let inside = write(&watched, "leaving.txt", "bye");
+        scan(&conn, &mut i, &watched, &ScanOptions::default()).expect("scan");
+
+        let outside = dir.path().join("elsewhere.txt");
+        std::fs::rename(&inside, &outside).expect("rename out");
+        record_rename(&conn, &mut i, &roots, &inside, &outside).expect("record rename");
+
+        let entries = timeline(&conn, &TimelineQuery::default()).expect("timeline");
+        assert_eq!(
+            entries[0].kind,
+            EventKind::Deleted,
+            "expected a deletion, got {:?}",
+            entries[0]
+        );
+    }
+
+    /// A file deleted and then recreated must work. The uniqueness index is
+    /// partial for exactly this: a tombstone left occupying the slot would make
+    /// the recreation a constraint violation.
+    #[test]
+    fn a_file_can_be_deleted_and_recreated() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+
+        let path = write(dir.path(), "flaky.txt", "first life");
+        scan(&conn, &mut i, dir.path(), &ScanOptions::default()).expect("scan");
+
+        std::fs::remove_file(&path).expect("remove");
+        record_removal(&conn, &mut i, &roots, &path).expect("record removal");
+
+        std::fs::write(&path, "second life, rather longer").expect("recreate");
+        record_path(&conn, &mut i, &roots, &path).expect("record recreation");
+
+        let kinds: Vec<String> = conn
+            .prepare("SELECT kind FROM events ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+
+        assert_eq!(
+            kinds,
+            vec!["created", "deleted", "created"],
+            "a delete-then-recreate should read as three events"
+        );
+
+        // Exactly one live row, so a later scan does not see two.
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files f
+                   JOIN path_components c ON c.id = f.component_id
+                  WHERE c.name = 'flaky.txt' AND f.deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(live, 1, "expected one live row after recreation");
     }
 
     /// Batching is the memory bound, so a corpus larger than one batch must

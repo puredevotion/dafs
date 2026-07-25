@@ -179,12 +179,86 @@ jobs:
       - name: Fuzz the metadata store (60s)
         run: cargo fuzz run migrations -- -max_total_time=60
 
+      # Filenames are bytes the user did not type: on Unix anything but NUL and
+      # `/` is a legal component, so invalid UTF-8 and traversal-shaped names
+      # arrive from nothing more exotic than scanning a directory.
+      - name: Fuzz path interning (60s)
+        run: cargo fuzz run paths -- -max_total_time=60
+
       - name: Upload crashers
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
+
+  dast:
+    # Dynamic scanning against a running daemon.
+    #
+    # The testing bar scopes DAST to milestones that actually have an HTTP
+    # surface — three in the whole roadmap — and M01's timeline API is the
+    # first. Listing it against a milestone with no server produces a checkbox
+    # nobody can honestly tick, so this job exists from here and not before.
+    #
+    # The daemon binds loopback and is unauthenticated by design, so the finding
+    # this is looking for is not "no auth" — that is a known, documented
+    # pairing. It is the accidental kind: a reflected value, a header that
+    # leaks a path, a crash on a malformed query.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the daemon
+        run: cargo build --release -p dafs-daemon
+
+      - name: Start it against a small corpus
+        run: |
+          mkdir -p /tmp/dast-corpus/docs /tmp/dast-data
+          echo "hello" > /tmp/dast-corpus/docs/note.md
+          echo "world" > /tmp/dast-corpus/readme.txt
+          # 0.0.0.0 so the scanner containers can reach it. Acceptable only
+          # because this is an ephemeral CI runner; the daemon's own default
+          # stays loopback.
+          ./target/release/dafs \
+            --listen 0.0.0.0:7878 \
+            --data-dir /tmp/dast-data \
+            --watch /tmp/dast-corpus \
+            --log info &
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:7878/readyz > /dev/null; then
+              echo "daemon ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::daemon did not become ready"; exit 1
+
+      - name: Confirm there is something to scan
+        # A scanner pointed at an empty timeline passes trivially. Fail loudly
+        # rather than report a clean run against no data.
+        run: |
+          events=$(curl -sf http://127.0.0.1:7878/events | grep -o '"id"' | wc -l)
+          echo "timeline has $events events"
+          [ "$events" -gt 0 ] || { echo "::error::no events to scan against"; exit 1; }
+
+      - name: OWASP ZAP baseline
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://127.0.0.1:7878
+          rules_file_name: .zap/rules.tsv
+          # Report, do not fail the build on warnings. ZAP's baseline flags
+          # missing security headers on every unauthenticated local API, and a
+          # gate that always fails is a gate everyone learns to ignore. Errors
+          # (an actual vulnerability rule) still fail.
+          cmd_options: "-a"
+          allow_issue_writing: false
+
+      - name: nuclei
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: http://127.0.0.1:7878
+          flags: "-severity critical,high,medium"
 
   no-private-references:
     # Structural counterpart to the hermetic build: catch internal hostnames and

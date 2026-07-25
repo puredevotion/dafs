@@ -189,9 +189,20 @@ pub fn upsert_entry(
     // The same asymmetry applies to the UNIQUE index — SQLite treats NULLs as
     // distinct — which is why roots are looked up explicitly here rather than
     // relying on the conflict clause to catch them.
+    //
+    // Live rows first. The uniqueness index is partial (`WHERE deleted_at IS
+    // NULL`), so a location can hold one live row plus any number of
+    // tombstones from files that were there before. Reviving an arbitrary
+    // tombstone when a live row already exists would resurrect the wrong file's
+    // history; `ORDER BY deleted_at IS NULL DESC` puts the live one first and
+    // otherwise takes the most recent corpse, which is the file that was most
+    // plausibly just recreated.
     let existing: Option<FileId> = conn
         .query_row(
-            "SELECT id FROM files WHERE parent_id IS ?1 AND component_id = ?2",
+            "SELECT id FROM files
+              WHERE parent_id IS ?1 AND component_id = ?2
+              ORDER BY deleted_at IS NULL DESC, deleted_at DESC
+              LIMIT 1",
             rusqlite::params![parent, component_id],
             |r| r.get(0),
         )

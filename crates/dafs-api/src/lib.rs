@@ -151,6 +151,13 @@ pub fn router(state: AppState) -> Router {
         // and what has to change if that bind ever widens.
         .route("/log-level", get(get_log_level).put(set_log_level))
         .fallback(not_found)
+        // Bound every request body. The only route that takes one expects a few
+        // dozen bytes, and without a limit an unauthenticated caller can make
+        // the daemon buffer an arbitrarily large payload — measurable against a
+        // 32 MiB ceiling. Applied at the router so a future route cannot forget
+        // it. 64 KiB is far above any legitimate body and far below anything
+        // that matters.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
 
@@ -602,6 +609,31 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("dafs_ready"), "core metrics lost: {body}");
         assert!(!body.contains("dafs_events_total"), "a failed stat was reported anyway");
+    }
+
+    /// An oversized body must be rejected before it is buffered. Found by the
+    /// M01 DAST pass, which pushed 2 MB into `/log-level` and got a 200.
+    #[tokio::test]
+    async fn an_oversized_body_is_rejected() {
+        let body = format!("{{\"filter\":\"{}\"}}", "a".repeat(2 * 1024 * 1024));
+
+        let resp = router(AppState::new(1))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/log-level")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an unbounded body lets a caller grow the daemon's footprint at will"
+        );
     }
 
     #[tokio::test]
