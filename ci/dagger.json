@@ -1,0 +1,6 @@
+{
+  "name": "dafs-ci",
+  "engineVersion": "v0.21.7",
+  "sdk": "go",
+  "source": "."
+}

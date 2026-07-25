@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Not published to crates.io: the deliverable is the daemon binary, not a set of
+# library crates. This also lets cargo-deny's allow-wildcard-paths exempt the
+# versionless intra-workspace path dependencies, which it only does for
+# unpublished crates (crates.io forbids path deps, so a published crate with one
+# is genuinely broken).
+publish = false
 
 [dependencies]
 tracing.workspace = true

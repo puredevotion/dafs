@@ -141,6 +141,31 @@ deliberate — widening the bind address is a decision for whoever adds auth.
 | `dafs-alloc` | allocator selection and RSS measurement |
 | `dafs-memtest` | RSS ceiling assertions against the release binary |
 
+### CI runs in two places, deliberately
+
+The same suite runs as GitHub Actions (`.github/workflows/ci.yml`) and as a
+Dagger module (`ci/`). GitHub is free and unmetered for a public repo and gives
+every fork and external PR CI with no setup, so it stays as the gate. The Dagger
+module means none of that is load-bearing — the identical checks run on any
+machine with Dagger, so the project does not depend on one forge remaining free,
+available, or willing to host it.
+
+```sh
+cd ci
+dagger call check        --source=..              # everything, in parallel
+dagger call test         --source=..
+dagger call hermetic     --source=..              # builds with the network off
+dagger call rss-ceiling  --source=..              # release binary, real RSS
+dagger call fuzz         --source=.. --seconds=60
+dagger call image        --source=..              # OCI container
+```
+
+A disagreement between the two is a real environment-dependency bug worth
+knowing about. Keep them in step: a check added to one belongs in the other.
+
+Release builds, artifacts, SBOM, and provenance are the one genuinely
+GitHub-specific part, in `.github/workflows/release.yml`, on version tags only.
+
 ### Hermetic builds are a requirement, not an aspiration
 
 The tree must build and test with no secrets, no network, and no private DNS.

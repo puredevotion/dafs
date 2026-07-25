@@ -1,9 +1,18 @@
-# The M00 CI gate. Every check here is a merge requirement.
+# The CI gate. Every check here is a merge requirement.
 #
 # The load-bearing property is that all of this runs with no secrets, no private
 # DNS, and no access to any deployment environment. A tree that cannot pass here
 # cannot be built by anyone but its author, which would defeat the point of the
 # repository being public.
+#
+# These checks are mirrored by the Dagger module in ci/, which runs the same
+# suite on any machine with Dagger installed. That redundancy is deliberate: it
+# means the project does not depend on a single forge staying free or available,
+# and a disagreement between the two is a real environment-dependency bug worth
+# knowing about. Keep the two in step — a check added here belongs in ci/main.go
+# too, and vice versa.
+#
+# Release builds and artifacts live in release.yml, on version tags only.
 name: CI
 
 on:

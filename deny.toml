@@ -22,13 +22,25 @@ allow = [
   "ISC",
   "Unicode-3.0",
   "Zlib",
-  "MPL-2.0",
 ]
 confidence-threshold = 0.9
+# `license-not-encountered` warnings for entries in this list are expected and
+# harmless: the list is what we are willing to accept, not what the current
+# dependency graph happens to use. Removing an entry the moment nothing uses it
+# just means adding it back the next time a transitive dependency shifts.
 
 [bans]
+# Duplicate versions are a warning, not an error: they are usually forced by a
+# transitive dependency we do not control (currently `syn`, pulled at two
+# versions by different proc-macro crates). Worth seeing, not worth blocking on.
 multiple-versions = "warn"
+
+# Wildcard requirements on registry crates are a real hazard — they let a
+# breaking release in silently. But intra-workspace `path` dependencies carry no
+# version by design and cargo-deny counts those as wildcards too, so exempt
+# exactly those while keeping the check on for anything from a registry.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
