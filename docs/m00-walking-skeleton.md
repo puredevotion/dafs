@@ -82,9 +82,16 @@ through five milestones before it earned anything. M01 picks a real frontend
 approach against actual requirements.
 
 **The fuzz crate is outside the workspace.** `cargo-fuzz` builds with its own
-sanitizer flags, and inheriting the workspace release profile (`panic = "abort"`)
-breaks libfuzzer's crash reporting. CI checks it still compiles, since
-`cargo test` does not cover it and it would otherwise rot silently.
+sanitizer flags and profile, which should not be inherited from — or impose
+themselves on — the workspace. CI checks it still compiles, since `cargo test`
+does not cover it and it would otherwise rot silently.
+
+**No `panic = "abort"` and no `strip` in the release profile.** Cargo applies
+profile settings to build-script and proc-macro binaries as well as the shipped
+one. Aborting breaks libfuzzer's ability to attribute a crash to an input, and a
+panic serving one API request should not take the daemon — and a user's metadata
+database — down with it. Stripping belongs in the packaging step, where it
+affects only the artifact actually shipped. Neither win is worth the cost here.
 
 ## Deliberately not done
 
@@ -101,6 +108,31 @@ breaks libfuzzer's crash reporting. CI checks it still compiles, since
 - **No auth.** The API binds loopback, which is the honest pairing for an
   unauthenticated surface. Widening the bind address is a decision for whoever
   adds auth.
+
+## Open: `nix build` fails in one specific environment
+
+`nix build .#dafs` fails with:
+
+```
+could not execute process .../build-script-build (never executed)
+Caused by: Permission denied (os error 13)
+```
+
+**This is not a defect in this repository.** It reproduces with a nine-line
+`Cargo.toml` whose only dependency is `quote`, no custom profile, and a
+three-line `default.nix` calling `buildRustPackage` — on two different machines,
+with the sandbox both on and off. Any `buildRustPackage` derivation with a
+build-script dependency fails the same way in that environment.
+
+Ruled out along the way, each by testing rather than reasoning: `panic = "abort"`
+in the release profile, `strip`, read-only permissions on the flake's store
+source, and a `noexec` build directory. The `panic`/`strip` removals were kept
+regardless, because they are right for other reasons (above), but neither was the
+cause.
+
+CI's `nix` job runs on a standard runner and is the authority on whether the
+flake itself is sound. Until that reports, the flake is unverified rather than
+known-good, and this note is here so nobody re-derives the same four dead ends.
 
 ## Bugs found while building this
 

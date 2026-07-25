@@ -22,7 +22,18 @@
             pname = "dafs";
             version = cargoToml.workspace.package.version;
 
-            src = self;
+            # Filtered rather than `self` so an unrelated doc or CI edit does not
+            # invalidate the derivation. `ui/` is included because dafs-api
+            # embeds index.html with include_str!.
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./crates
+                ./ui
+              ];
+            };
             cargoLock.lockFile = ./Cargo.lock;
 
             # rusqlite's `bundled` feature compiles SQLite from vendored C, so

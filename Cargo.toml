@@ -57,8 +57,21 @@ tempfile = "3"
 # A filesystem daemon is long-lived: spend build time, not runtime.
 lto = "thin"
 codegen-units = 1
-panic = "abort"
-strip = "symbols"
+
+# Deliberately NOT panic = "abort":
+#
+#  - It breaks libfuzzer's crash reporting, which needs to unwind to attribute a
+#    crash to an input.
+#  - A panic while serving one API request should not take the daemon — and a
+#    user's metadata database — down with it. Unwinding lets the request fail
+#    alone.
+#
+# The binary-size and speed win is not worth either of those for this workload.
+#
+# Also deliberately no `strip`: cargo applies profile settings to build-script
+# and proc-macro binaries too, and stripping those is a route to obscure
+# build-time failures. Strip the shipped binary in the packaging step instead,
+# where it only affects the artifact that is actually shipped.
 
 # The RSS assertion harness (crates/dafs-memtest) measures the release binary.
 # Debug builds have wildly different allocation behaviour and are not a valid
