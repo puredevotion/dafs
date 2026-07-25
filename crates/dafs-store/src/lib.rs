@@ -1,10 +1,25 @@
 //! Metadata store: SQLite schema, migrations, and connection tuning.
 //!
-//! M00 ships the migration runner and the tuning, with a schema that is
-//! deliberately minimal (one table, recording the migrations themselves). M01
-//! adds the real `files`/`events` tables. The point of doing this now is that
-//! the *mechanism* — forward-only migrations, applied in a transaction, with a
-//! crash-consistency test — is what later milestones depend on being correct.
+//! M00 shipped the migration runner and the tuning against a deliberately
+//! minimal schema. M01 adds the real tables: interned path components, files,
+//! and the append-only event log the timeline reads from.
+//!
+//! # Paths are interned, not stored
+//!
+//! No table here holds a path string. A path is a chain of *components*, each
+//! interned once in `path_components` and referenced by id, with `files.parent_id`
+//! pointing at the containing directory. Reconstructing a path means walking
+//! parent links back to the root.
+//!
+//! This is not premature optimisation, it is the M01 memory requirement
+//! (`docs/memory-budget.md` §M01): a million paths averaging ~80 bytes is ~80 MB
+//! of `String` before any structure at all, against a 32 MiB idle ceiling. The
+//! tree shape means components repeat heavily — `home`, `src`, `Documents` are
+//! stored once each regardless of how many paths contain them.
+//!
+//! It also has to land *now* rather than later: M07's knowledge graph will hang
+//! relations off path ids, and retrofitting interning underneath a graph that
+//! already references path strings is far more invasive than doing it here.
 //!
 //! # Connection tuning
 //!
@@ -19,6 +34,9 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+
+pub mod events;
+pub mod paths;
 
 /// Store errors. Migration failures carry the version so a failed upgrade
 /// names the offending step rather than just "SQL error".
@@ -43,6 +61,12 @@ pub enum StoreError {
          upgrade dafs or point at a different data directory"
     )]
     SchemaTooNew { found: u32, supported: u32 },
+
+    /// A path with no components — `/` or an empty string. Rejected rather than
+    /// silently treated as a root, because the caller almost certainly meant
+    /// something else and a fabricated root row would be hard to notice.
+    #[error("path has no components")]
+    EmptyPath,
 }
 
 /// One forward-only schema step.
@@ -55,17 +79,84 @@ struct Migration {
 /// Every migration, in order. Append only — never edit or reorder a shipped
 /// entry, because databases in the wild have already applied it and the
 /// recorded version would no longer describe their actual schema.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "schema_version",
-    sql: "
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "schema_version",
+        sql: "
         CREATE TABLE schema_migrations (
             version    INTEGER PRIMARY KEY,
             name       TEXT    NOT NULL,
             applied_at INTEGER NOT NULL
         ) STRICT;
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "timeline",
+        sql: "
+        -- One row per distinct path component, ever. `home` is stored once no
+        -- matter how many paths begin with it. See the module docs for why the
+        -- schema stores no path strings at all.
+        CREATE TABLE path_components (
+            id   INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+        ) STRICT;
+
+        -- A file or directory. `parent_id` is the containing directory, NULL
+        -- only for a watch root. The (parent_id, component_id) pair is unique:
+        -- a directory cannot hold two entries with the same name, which is a
+        -- filesystem invariant worth having the database enforce rather than
+        -- trusting the scanner to maintain.
+        --
+        -- `parent_id` is self-referential rather than a materialised path, so a
+        -- directory rename is one row updated instead of a subtree rewrite.
+        CREATE TABLE files (
+            id           INTEGER PRIMARY KEY,
+            parent_id    INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            component_id INTEGER NOT NULL REFERENCES path_components(id),
+            is_dir       INTEGER NOT NULL CHECK (is_dir IN (0, 1)),
+            size_bytes   INTEGER,
+            mtime_unix   INTEGER,
+            -- NULL until content is hashed; directories never have one.
+            content_hash BLOB,
+            -- Set when the entry is observed gone. Rows are tombstoned rather
+            -- than deleted so events referencing them keep resolving, and so a
+            -- delete is itself a fact the timeline can show.
+            deleted_at   INTEGER,
+            UNIQUE (parent_id, component_id)
+        ) STRICT;
+
+        CREATE INDEX files_parent ON files(parent_id);
+
+        -- The append-only event log. This is the primary historical view and,
+        -- per the architecture, the unit of synchronisation from M06 onward —
+        -- so it is written once and never updated in place.
+        --
+        -- `kind` is text rather than an integer enum: the log outlives any one
+        -- build, and a value that is readable in a bare sqlite3 shell during an
+        -- incident is worth more than the bytes saved.
+        CREATE TABLE events (
+            id         INTEGER PRIMARY KEY,
+            file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            kind       TEXT    NOT NULL CHECK (kind IN ('created', 'modified', 'deleted', 'renamed')),
+            -- Milliseconds, not seconds: a scan generates many events inside one
+            -- second and the timeline orders by this.
+            at_unix_ms INTEGER NOT NULL,
+            size_bytes INTEGER,
+            -- For 'renamed', the file's previous parent/component, so the
+            -- timeline can say what it was called before without another table.
+            prev_parent_id    INTEGER REFERENCES files(id) ON DELETE SET NULL,
+            prev_component_id INTEGER REFERENCES path_components(id)
+        ) STRICT;
+
+        -- The timeline's only query shape: most recent first. Descending so the
+        -- index is walked forwards rather than backwards.
+        CREATE INDEX events_recent ON events(at_unix_ms DESC, id DESC);
+        CREATE INDEX events_by_file ON events(file_id, at_unix_ms DESC);
+    ",
+    },
+];
 
 /// The highest schema version this build understands.
 pub fn supported_version() -> u32 {
