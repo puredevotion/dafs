@@ -4,21 +4,39 @@
 //! the only place that converts between the two representations, so the
 //! invariant has one enforcement point rather than being a convention.
 //!
-//! # The cache
+//! # The cache, and what does not go in it
 //!
 //! Interning every component through SQLite would put two statements on the hot
-//! path of a scan that walks a million files. Most components repeat — a scan of
-//! one tree touches the same directory names constantly — so an in-memory
-//! `name -> id` map absorbs nearly all of it.
+//! path of a scan that walks a million files, so hot components are cached in an
+//! in-memory `name -> id` map.
 //!
-//! The cache is bounded, because an unbounded one is a memory leak wearing a
-//! hat: a scan over a corpus with a million *distinct* component names would
-//! otherwise put all of them in RAM, which is the exact failure the interning
-//! exists to prevent. When it fills, it is cleared rather than evicted
-//! per-entry: an LRU needs a second data structure and per-access bookkeeping to
-//! save a handful of statements against a database that is already warm in page
-//! cache. Correctness does not depend on the cache at all — a miss is a query,
-//! never a wrong answer.
+//! **Only directory components are cached.** This is the whole design, and
+//! getting it wrong is a memory bug rather than a slow path:
+//!
+//! - *Directory* names repeat enormously. A million-file tree might contain a
+//!   few thousand distinct directory names, each appearing in thousands of
+//!   paths. Caching them turns almost every lookup into a hash hit.
+//! - *Leaf* names are nearly all distinct — that is what makes them filenames.
+//!   Caching them means one entry per file in the corpus, which is precisely the
+//!   per-file resident state the interning exists to eliminate. Each entry is
+//!   only ~50 bytes, but a million of them is ~50 MB against a 128 MiB scan
+//!   ceiling, and every one of those entries would be a cache line that is never
+//!   read again.
+//!
+//! An earlier version of this module cached both and grew linearly with corpus
+//! size at ~430 bytes per file — caught by `dafs-scan`'s growth test, which is
+//! there precisely because a single-size ceiling check would have passed.
+//!
+//! So [`Interner::intern_dir`] caches and [`Interner::intern_leaf`] does not.
+//! Correctness does not depend on either: a miss is a query, never a wrong
+//! answer, and the `UNIQUE` constraint on `path_components.name` is what
+//! actually guarantees one id per name.
+//!
+//! The cache is still bounded as a backstop, for the pathological tree whose
+//! directory names are themselves all distinct. When it fills it is cleared
+//! rather than evicted per-entry: an LRU needs a second data structure and
+//! per-access bookkeeping to save a handful of statements against a database
+//! already warm in page cache.
 
 use std::collections::HashMap;
 use std::path::{Component, Path};
@@ -27,11 +45,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::StoreError;
 
-/// Rows in the component cache before it is cleared.
+/// Directory names cached before the cache is cleared.
 ///
-/// 64k entries at ~32 bytes each is ~2 MiB against a 32 MiB ceiling — large
-/// enough that a normal tree never clears it, small enough to be bounded.
-const CACHE_CAPACITY: usize = 65_536;
+/// Sized for directory names, not files: a tree with more than 16k *distinct*
+/// directory names is already unusual, and at ~50 bytes an entry this bound is
+/// under 1 MiB. Leaf names never enter the cache at all (see the module docs),
+/// so this no longer scales with corpus size.
+const CACHE_CAPACITY: usize = 16_384;
 
 /// A file or directory id.
 pub type FileId = i64;
@@ -60,28 +80,17 @@ impl Interner {
         self.cache.len()
     }
 
-    /// Return the id for `name`, inserting it if new.
+    /// Intern a **directory** component, caching the result.
     ///
-    /// `INSERT ... ON CONFLICT DO NOTHING` followed by a select, rather than
-    /// `INSERT OR IGNORE ... RETURNING`: with `DO NOTHING` the returning clause
-    /// yields no row on conflict, so the select is needed either way, and this
-    /// shape is one round trip in the common already-present case.
-    pub fn intern(&mut self, conn: &Connection, name: &str) -> Result<ComponentId, StoreError> {
+    /// Use this for anything that repeats across paths. See the module docs for
+    /// why the distinction from [`Self::intern_leaf`] is a memory requirement
+    /// rather than a tuning choice.
+    pub fn intern_dir(&mut self, conn: &Connection, name: &str) -> Result<ComponentId, StoreError> {
         if let Some(&id) = self.cache.get(name) {
             return Ok(id);
         }
 
-        let existing: Option<ComponentId> = conn
-            .query_row("SELECT id FROM path_components WHERE name = ?1", [name], |r| r.get(0))
-            .optional()?;
-
-        let id = match existing {
-            Some(id) => id,
-            None => {
-                conn.execute("INSERT INTO path_components (name) VALUES (?1)", [name])?;
-                conn.last_insert_rowid()
-            }
-        };
+        let id = self.lookup_or_insert(conn, name)?;
 
         if self.cache.len() >= CACHE_CAPACITY {
             // Bounded, not an LRU — see the module docs.
@@ -90,6 +99,45 @@ impl Interner {
         self.cache.insert(name.into(), id);
 
         Ok(id)
+    }
+
+    /// Intern a **leaf** (file) name without caching it.
+    ///
+    /// Filenames are nearly all distinct, so caching them would add one resident
+    /// entry per file in the corpus for a hit rate near zero. The database is
+    /// warm and the `name` column is UNIQUE-indexed, so the lookup this costs is
+    /// a page-cache hit rather than disk I/O.
+    ///
+    /// It still *reads* the cache first: a name that happens to also be a
+    /// directory name elsewhere in the tree is then free, and the check costs
+    /// one hash.
+    pub fn intern_leaf(
+        &mut self,
+        conn: &Connection,
+        name: &str,
+    ) -> Result<ComponentId, StoreError> {
+        if let Some(&id) = self.cache.get(name) {
+            return Ok(id);
+        }
+        self.lookup_or_insert(conn, name)
+    }
+
+    /// Select-then-insert against `path_components`.
+    ///
+    /// Select first rather than `INSERT OR IGNORE` then select: the
+    /// already-present case is overwhelmingly the common one during a rescan,
+    /// and this makes it a single statement.
+    fn lookup_or_insert(&self, conn: &Connection, name: &str) -> Result<ComponentId, StoreError> {
+        let existing: Option<ComponentId> = conn
+            .query_row("SELECT id FROM path_components WHERE name = ?1", [name], |r| r.get(0))
+            .optional()?;
+
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        conn.execute("INSERT INTO path_components (name) VALUES (?1)", [name])?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// Read back the name for a component id.
@@ -113,7 +161,7 @@ pub fn ensure_dir_chain(
     let mut parent: Option<FileId> = None;
 
     for component in normalised_components(dir) {
-        let component_id = interner.intern(conn, &component)?;
+        let component_id = interner.intern_dir(conn, &component)?;
         parent = Some(upsert_entry(conn, parent, component_id, true, None, None)?);
     }
 
@@ -265,11 +313,11 @@ mod tests {
         let conn = db();
         let mut i = Interner::new();
 
-        let a = i.intern(&conn, "documents").expect("intern");
-        let b = i.intern(&conn, "documents").expect("intern again");
+        let a = i.intern_dir(&conn, "documents").expect("intern");
+        let b = i.intern_dir(&conn, "documents").expect("intern again");
         assert_eq!(a, b, "same name must yield the same id");
 
-        let c = i.intern(&conn, "downloads").expect("intern other");
+        let c = i.intern_dir(&conn, "downloads").expect("intern other");
         assert_ne!(a, c);
 
         let rows: i64 = conn
@@ -283,10 +331,47 @@ mod tests {
     fn cold_cache_agrees_with_warm_cache() {
         let conn = db();
         let mut warm = Interner::new();
-        let id = warm.intern(&conn, "src").expect("intern");
+        let id = warm.intern_dir(&conn, "src").expect("intern");
 
         let mut cold = Interner::new();
-        assert_eq!(cold.intern(&conn, "src").expect("intern"), id);
+        assert_eq!(cold.intern_dir(&conn, "src").expect("intern"), id);
+    }
+
+    /// The memory property the whole `intern_dir`/`intern_leaf` split exists
+    /// for. Without this, a future refactor that "simplifies" the two methods
+    /// back into one would reintroduce linear growth, and the only thing
+    /// catching it would be a slow scan-level test in another crate.
+    #[test]
+    fn leaf_names_never_enter_the_cache() {
+        let conn = db();
+        let mut i = Interner::new();
+
+        for n in 0..1_000 {
+            i.intern_leaf(&conn, &format!("file-{n}.txt")).expect("intern leaf");
+        }
+
+        assert_eq!(i.cached(), 0, "leaf names were cached: {} entries", i.cached());
+
+        // They are still interned — just not held in memory.
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM path_components", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1_000, "leaf names were not interned at all");
+    }
+
+    /// Both methods must agree on the id for a given name, or a file whose name
+    /// matches a directory name would get two rows.
+    #[test]
+    fn dir_and_leaf_interning_agree_on_ids() {
+        let conn = db();
+        let mut i = Interner::new();
+
+        let as_dir = i.intern_dir(&conn, "notes").expect("dir");
+        let as_leaf = i.intern_leaf(&conn, "notes").expect("leaf");
+        assert_eq!(as_dir, as_leaf);
+
+        let mut cold = Interner::new();
+        assert_eq!(cold.intern_leaf(&conn, "notes").expect("cold leaf"), as_dir);
     }
 
     #[test]
@@ -294,7 +379,7 @@ mod tests {
         let conn = db();
         let mut i = Interner::new();
         for n in 0..(CACHE_CAPACITY + 100) {
-            i.intern(&conn, &format!("component-{n}")).expect("intern");
+            i.intern_dir(&conn, &format!("component-{n}")).expect("intern");
         }
         assert!(i.cached() <= CACHE_CAPACITY, "cache grew past its bound: {} entries", i.cached());
     }

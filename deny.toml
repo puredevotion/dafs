@@ -20,6 +20,13 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
+  # A public-domain dedication rather than a licence, and more permissive than
+  # everything above it — it imposes no attribution or notice requirement at
+  # all. Added deliberately for `notify`, the filesystem watcher M01 depends on.
+  # Note that CC0 does not grant patent rights, which several of the entries
+  # above do; that matters for a patent-heavy dependency and does not for a
+  # filesystem event wrapper.
+  "CC0-1.0",
   "Unicode-3.0",
   "Zlib",
 ]

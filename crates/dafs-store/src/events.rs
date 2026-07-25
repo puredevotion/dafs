@@ -314,7 +314,12 @@ pub fn file_count(conn: &Connection) -> Result<i64, StoreError> {
     )?)
 }
 
-pub(crate) fn now_unix_ms() -> i64 {
+/// Current wall-clock time in milliseconds since the epoch.
+///
+/// Public because the watcher timestamps tombstones with it, and a second
+/// implementation there could disagree about units — which would sort deletions
+/// into 1970 in the timeline.
+pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -434,7 +439,7 @@ mod tests {
         let mut i = Interner::new();
 
         let old_dir = ensure_dir_chain(&conn, &mut i, Path::new("/home/user")).expect("dir");
-        let old_name = i.intern(&conn, "before.md").expect("intern");
+        let old_name = i.intern_leaf(&conn, "before.md").expect("intern");
         let file = ensure_dir_chain(&conn, &mut i, Path::new("/home/user/after.md")).expect("file");
 
         append(
@@ -508,7 +513,7 @@ mod tests {
 
         // ensure_dir_chain makes directories; a file row is the leaf.
         let dir = ensure_dir_chain(&conn, &mut i, Path::new("/home/user")).expect("dir");
-        let name = i.intern(&conn, "notes.md").expect("intern");
+        let name = i.intern_leaf(&conn, "notes.md").expect("intern");
         let file = crate::paths::upsert_entry(&conn, Some(dir), name, false, Some(10), Some(0))
             .expect("file");
 
