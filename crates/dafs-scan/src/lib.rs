@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dafs_store::events::{EventKind, NewEvent, append_batch, now_unix_ms};
+use dafs_store::events::{EventKind, NewEvent, now_unix_ms};
 use dafs_store::paths::{FileId, Interner, ensure_dir_chain, upsert_entry};
 use rusqlite::Connection;
 
@@ -158,6 +158,77 @@ pub fn scan(
     // needs its own row rather than re-walking its ancestors.
     let root_id = ensure_dir_chain(conn, interner, root)?;
 
+    // Each batch runs inside one transaction covering **both** the `files`
+    // upserts and the events they produce.
+    //
+    // This is a crash-consistency requirement, not a performance tweak. With
+    // the upserts committing immediately and the events only at flush, a
+    // `kill -9` between the two leaves file rows with no event — and because a
+    // rescan sees those files as unchanged (size and mtime already match), it
+    // emits nothing for them. The file is in the store but absent from history,
+    // permanently. Measured at 305 such rows on an 8k-file corpus before this
+    // was fixed; `tests/crash_consistency.rs` is the regression test.
+    // The walk runs in a helper so that an error partway through cannot return
+    // past an open transaction. Rust has no `defer`, and rusqlite's `Transaction`
+    // guard cannot be held here because the batch loop needs `&Connection` for
+    // the interner as well — so the rollback is explicit, and this is the shape
+    // that guarantees it always runs.
+    let mut tx_open = false;
+    let result = scan_inner(
+        conn,
+        interner,
+        root,
+        root_id,
+        options,
+        &mut summary,
+        &mut batch,
+        &mut batches_since_checkpoint,
+        &mut tx_open,
+    );
+
+    if let Err(e) = result {
+        if tx_open && let Err(rollback) = conn.execute_batch("ROLLBACK") {
+            // Log rather than mask the original error: the rollback failing is
+            // worth knowing about, but the scan error is what the caller needs.
+            tracing::error!("rolling back after a scan error also failed: {rollback}");
+        }
+        return Err(e);
+    }
+
+    // A final checkpoint so the scan does not leave its whole WAL behind for
+    // the next reader to fault in.
+    checkpoint(conn);
+
+    tracing::info!(
+        root = %root.display(),
+        files = summary.files_seen,
+        dirs = summary.dirs_seen,
+        events = summary.events_recorded,
+        skipped = summary.skipped,
+        elapsed_ms = started.elapsed().as_millis(),
+        anon_bytes = anonymous_rss().unwrap_or(0),
+        interner_cached = interner.cached(),
+        "scan complete"
+    );
+
+    Ok(summary)
+}
+
+/// The walk itself. See [`scan`] for why this is a separate function.
+#[allow(clippy::too_many_arguments)]
+fn scan_inner(
+    conn: &Connection,
+    interner: &mut Interner,
+    root: &Path,
+    root_id: FileId,
+    options: &ScanOptions,
+    summary: &mut ScanSummary,
+    batch: &mut Vec<NewEvent>,
+    batches_since_checkpoint: &mut usize,
+    tx_open: &mut bool,
+) -> Result<(), ScanError> {
+    begin(conn, tx_open)?;
+
     let walker = walkdir::WalkDir::new(root)
         .follow_links(options.follow_symlinks)
         .into_iter()
@@ -223,13 +294,18 @@ pub fn scan(
         // Flush on a fixed batch size, not at the end: this is the bound that
         // keeps peak memory independent of corpus size.
         if batch.len() >= BATCH_SIZE {
-            append_batch(conn, &batch)?;
+            // Events first, then commit: the upserts for these entries are
+            // already in this transaction, so the two land together.
+            append_events(conn, batch)?;
+            commit(conn, tx_open)?;
             batch.clear();
 
-            batches_since_checkpoint += 1;
-            if batches_since_checkpoint >= BATCHES_PER_CHECKPOINT {
+            *batches_since_checkpoint += 1;
+            if *batches_since_checkpoint >= BATCHES_PER_CHECKPOINT {
+                // Between transactions, never inside one: a checkpoint cannot
+                // run with a write transaction open.
                 checkpoint(conn);
-                batches_since_checkpoint = 0;
+                *batches_since_checkpoint = 0;
 
                 // Progress with the memory numbers attached, at debug. A long
                 // scan is otherwise silent for minutes, and when the ceiling is
@@ -247,27 +323,53 @@ pub fn scan(
                     "scan progress"
                 );
             }
+
+            begin(conn, tx_open)?;
         }
     }
 
-    append_batch(conn, &batch)?;
-    // A final checkpoint so the scan does not leave its whole WAL behind for
-    // the next reader to fault in.
-    checkpoint(conn);
+    // The final partial batch, in the transaction its upserts already live in.
+    append_events(conn, batch)?;
+    commit(conn, tx_open)?;
 
-    tracing::info!(
-        root = %root.display(),
-        files = summary.files_seen,
-        dirs = summary.dirs_seen,
-        events = summary.events_recorded,
-        skipped = summary.skipped,
-        elapsed_ms = started.elapsed().as_millis(),
-        anon_bytes = anonymous_rss().unwrap_or(0),
-        interner_cached = interner.cached(),
-        "scan complete"
-    );
+    Ok(())
+}
 
-    Ok(summary)
+/// Open the per-batch transaction.
+///
+/// `IMMEDIATE` takes the write lock up front rather than upgrading partway
+/// through. The scan writes from its first statement, so deferring only creates
+/// a window in which another writer can take the lock and force this one to
+/// fail mid-batch.
+fn begin(conn: &Connection, open: &mut bool) -> Result<(), ScanError> {
+    if *open {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    *open = true;
+    Ok(())
+}
+
+fn commit(conn: &Connection, open: &mut bool) -> Result<(), ScanError> {
+    if !*open {
+        return Ok(());
+    }
+    conn.execute_batch("COMMIT")?;
+    *open = false;
+    Ok(())
+}
+
+/// Append events on the current connection, without opening a transaction.
+///
+/// Distinct from `dafs_store::events::append_batch`, which wraps its own: here
+/// the caller already holds one spanning the `files` upserts these events refer
+/// to, and a nested transaction would commit the events separately — which is
+/// exactly the bug this design exists to prevent.
+fn append_events(conn: &Connection, events: &[NewEvent]) -> Result<(), ScanError> {
+    for event in events {
+        dafs_store::events::append(conn, event)?;
+    }
+    Ok(())
 }
 
 /// Record a single path observed by the watcher.

@@ -40,20 +40,43 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .expect("usage: scan_probe <file-count>");
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    build_corpus(dir.path(), count);
+    // Scan an existing tree when asked to, instead of building a fresh one.
+    // The crash-consistency test uses this: it needs a scan it can SIGKILL
+    // partway through, against a corpus and database that outlive the process.
+    let existing = std::env::var_os("DAFS_PROBE_SCAN_DIR").map(std::path::PathBuf::from);
+
+    // Held so the temporary directory outlives the scan; unused when scanning
+    // an existing tree.
+    let owned_dir = if existing.is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        build_corpus(dir.path(), count);
+        Some(dir)
+    } else {
+        None
+    };
+
+    let root = existing
+        .clone()
+        .unwrap_or_else(|| owned_dir.as_ref().expect("owned dir").path().to_path_buf());
 
     // The store lives under `.dafs`, which the default skip list excludes, so
     // the scanner does not observe its own writes.
-    let db_dir = dir.path().join(".dafs");
-    std::fs::create_dir_all(&db_dir).expect("create db dir");
-    let conn = dafs_store::open(&db_dir.join("meta.sqlite")).expect("open store");
+    let db_path = match std::env::var_os("DAFS_PROBE_DB") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let db_dir = root.join(".dafs");
+            std::fs::create_dir_all(&db_dir).expect("create db dir");
+            db_dir.join("meta.sqlite")
+        }
+    };
+
+    let conn = dafs_store::open(&db_path).expect("open store");
     let mut interner = Interner::new();
 
     let baseline = anonymous_rss().expect("anonymous rss baseline");
     let baseline_total = total_rss().expect("total rss baseline");
 
-    scan(&conn, &mut interner, dir.path(), &ScanOptions::default()).expect("scan");
+    scan(&conn, &mut interner, &root, &ScanOptions::default()).expect("scan");
 
     // Sampled at the end of the scan rather than continuously: the scan holds
     // no transient allocation larger than one batch, so this is the peak. A

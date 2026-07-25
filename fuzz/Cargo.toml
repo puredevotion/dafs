@@ -23,3 +23,13 @@ path = "fuzz_targets/migrations.rs"
 test = false
 doc = false
 bench = false
+
+# Filenames are bytes the user did not type: on Unix any sequence except NUL and
+# `/` is a legal name, so invalid UTF-8 and traversal-shaped components arrive
+# from nothing more exotic than scanning a directory.
+[[bin]]
+name = "paths"
+path = "fuzz_targets/paths.rs"
+test = false
+doc = false
+bench = false
