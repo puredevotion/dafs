@@ -53,6 +53,11 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 
+# `dafs --detach`. The fork/setsid/redirect dance itself needs unsafe libc
+# calls, which crates/dafs-daemon forbids in its own code (`forbid(unsafe_code)`);
+# this crate keeps that unsafety contained and out of ours.
+daemonize = "0.5"
+
 [profile.release]
 # A filesystem daemon is long-lived: spend build time, not runtime.
 lto = "thin"

@@ -331,7 +331,7 @@ async fn put_watch(
     State(state): State<AppState>,
     Json(body): Json<WatchChangeRequest>,
 ) -> impl IntoResponse {
-    let Some(control) = state.watch_control() else {
+    let Some(control) = state.watch_control().cloned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError { error: "watch control not attached" }),
@@ -348,20 +348,39 @@ async fn put_watch(
             .into_response();
     }
 
-    let result = match body.mode {
-        WatchMode::Add => control.add_roots(body.roots),
-        WatchMode::Replace => control.replace_roots(body.roots),
-    };
+    // spawn_blocking because the real implementation waits on a reply from
+    // the observer thread (it scans a new root before answering) — the same
+    // reason /events's store query runs off the single-threaded runtime.
+    // Computing `roots()` inside the same blocking closure, right after the
+    // change, is what makes the response actually reflect the change rather
+    // than a snapshot that could race a second concurrent request.
+    let mode = body.mode;
+    let roots = body.roots;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let result = match mode {
+            WatchMode::Add => control.add_roots(roots),
+            WatchMode::Replace => control.replace_roots(roots),
+        };
+        result.map(|()| control.roots())
+    })
+    .await;
 
-    match result {
-        Ok(()) => {
-            (StatusCode::OK, Json(WatchRootsResponse { roots: control.roots() })).into_response()
-        }
-        // The caller's error (a bad path), not the server's — a 500 here
-        // would tell a reconfiguring client to retry, which would not help.
-        Err(e) => {
+    match outcome {
+        Ok(Ok(roots)) => (StatusCode::OK, Json(WatchRootsResponse { roots })).into_response(),
+        // The caller's error (a bad path, or the observer rejecting it), not
+        // the server's — a 500 here would tell a reconfiguring client to
+        // retry, which would not help.
+        Ok(Err(e)) => {
             tracing::warn!("rejected watch-root change: {e}");
             (StatusCode::BAD_REQUEST, Json(WatchError { error: e })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("watch-root change task panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: "watch change task failed" }),
+            )
+                .into_response()
         }
     }
 }
