@@ -1,13 +1,13 @@
 {
-  "crates/dafs-daemon": "0.0.4",
-  "crates/dafs-alloc": "0.0.4",
-  "crates/dafs-api": "0.0.4",
-  "crates/dafs-detach": "0.0.4",
-  "crates/dafs-enrich": "0.0.4",
-  "crates/dafs-extract": "0.0.4",
-  "crates/dafs-memtest": "0.0.4",
-  "crates/dafs-pdf-worker": "0.0.4",
-  "crates/dafs-scan": "0.0.4",
-  "crates/dafs-store": "0.0.4",
-  "crates/dafs-tui": "0.0.4"
+  "crates/dafs-daemon": "0.0.5",
+  "crates/dafs-alloc": "0.0.5",
+  "crates/dafs-api": "0.0.5",
+  "crates/dafs-detach": "0.0.5",
+  "crates/dafs-enrich": "0.0.5",
+  "crates/dafs-extract": "0.0.5",
+  "crates/dafs-memtest": "0.0.5",
+  "crates/dafs-pdf-worker": "0.0.5",
+  "crates/dafs-scan": "0.0.5",
+  "crates/dafs-store": "0.0.5",
+  "crates/dafs-tui": "0.0.5"
 }

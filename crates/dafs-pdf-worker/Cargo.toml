@@ -1,7 +1,7 @@
 [package]
 name = "dafs-pdf-worker"
 description = "DAFS PDF text extraction: a supervised child process wrapping pdfium-render"
-version = "0.0.4"
+version = "0.0.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

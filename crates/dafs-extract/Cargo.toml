@@ -1,7 +1,7 @@
 [package]
 name = "dafs-extract"
 description = "DAFS deterministic metadata extraction: PDF, Office, EXIF, git, no LLM"
-version = "0.0.4"
+version = "0.0.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
