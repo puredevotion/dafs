@@ -177,7 +177,7 @@ fn main() -> anyhow::Result<()> {
         detach::start(&canonical_data_dir)?;
     }
 
-    let log_handle = init_tracing(&args.log)?;
+    let (log_handle, log_history) = init_tracing(&args.log)?;
 
     // Single-threaded until there is concurrent work to justify otherwise. A
     // multi-thread runtime pre-spawns a worker per core, each with its own
@@ -187,12 +187,13 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?
-        .block_on(run(args, log_handle, canonical_data_dir))
+        .block_on(run(args, log_handle, log_history, canonical_data_dir))
 }
 
 async fn run(
     args: Args,
     log_handle: dafs_api::LogLevelHandle,
+    log_history: dafs_api::LogHistory,
     canonical_data_dir: PathBuf,
 ) -> anyhow::Result<()> {
     // Bind first, migrate second: see the module docs on startup ordering.
@@ -217,7 +218,8 @@ async fn run(
     let state = dafs_api::AppState::new(schema_version)
         .with_timeline(Arc::clone(&timeline))
         .with_log_level(log_handle)
-        .with_watch_control(watch_control);
+        .with_watch_control(watch_control)
+        .with_log_history(log_history);
 
     // Ready once the schema is usable. The observer starts after this and runs
     // for minutes on a large tree; holding readiness until it finished would
@@ -737,25 +739,40 @@ async fn shutdown_signal() {
     }
 }
 
-/// Install the subscriber and return a handle that can change its filter later.
+/// Install the subscriber and return a handle that can change its filter
+/// later, plus the ring buffer a second sink writes into.
 ///
-/// The handle is what makes `PUT /log-level` possible. Reproducing a problem is
-/// usually the expensive part of diagnosing one, and a daemon that must be
-/// restarted to raise its log level loses the state that was about to be
-/// explained — a scan mid-flight, a watch that has just gone quiet. Being able
-/// to turn on `trace` against the running process and turn it off again is
-/// worth the one indirection it costs.
-fn init_tracing(filter: &str) -> anyhow::Result<dafs_api::LogLevelHandle> {
+/// The filter handle is what makes `PUT /log-level` possible. Reproducing a
+/// problem is usually the expensive part of diagnosing one, and a daemon
+/// that must be restarted to raise its log level loses the state that was
+/// about to be explained — a scan mid-flight, a watch that has just gone
+/// quiet. Being able to turn on `trace` against the running process and turn
+/// it off again is worth the one indirection it costs.
+///
+/// Two `fmt::layer()`s, not one: the first writes to stdout (a file, once
+/// `--detach` has redirected it) exactly as before; the second writes into
+/// `dafs_api::LogHistory` so `GET /logs` can serve it. Both sit behind the
+/// same reloadable filter, so raising verbosity affects what a caller can
+/// see through `/logs` too, not just what lands in the file.
+fn init_tracing(filter: &str) -> anyhow::Result<(dafs_api::LogLevelHandle, dafs_api::LogHistory)> {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 
     let env_filter =
         EnvFilter::try_new(filter).with_context(|| format!("invalid log filter {filter:?}"))?;
 
     let (layer, handle) = reload::Layer::new(env_filter);
+    let history = dafs_api::LogHistory::new();
+    let history_sink = history.clone();
 
     tracing_subscriber::registry()
         .with(layer)
         .with(fmt::layer().with_target(true))
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(move || history_sink.writer()),
+        )
         .try_init()
         .map_err(|e| {
             // try_init fails only if a subscriber is already set, which in a
@@ -764,7 +781,7 @@ fn init_tracing(filter: &str) -> anyhow::Result<dafs_api::LogLevelHandle> {
             anyhow::anyhow!("installing tracing subscriber: {e}")
         })?;
 
-    Ok(dafs_api::LogLevelHandle::new(handle, filter.to_string()))
+    Ok((dafs_api::LogLevelHandle::new(handle, filter.to_string()), history))
 }
 
 #[cfg(test)]
