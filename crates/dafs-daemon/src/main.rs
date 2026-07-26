@@ -350,6 +350,27 @@ fn apply_change(
 /// for a code path that runs rarely.
 const INSTALL_SCRIPT: &str = include_str!("../../../scripts/install.sh");
 
+/// Build the argument list passed to `sh -s -- <these>` (the installer script
+/// reads them as its own positional params). Pure and separate from
+/// [`self_update`] so the exact invocation is unit-testable without spawning
+/// a process.
+fn self_update_script_args(
+    check_only: bool,
+    current_exe: &std::path::Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if check_only {
+        args.push("--check-only".into());
+    } else {
+        args.push("--self-update".into());
+        args.push("--target-path".into());
+        args.push(current_exe.into());
+    }
+    args.push("--current-version".into());
+    args.push(env!("CARGO_PKG_VERSION").into());
+    args
+}
+
 /// Run the embedded installer script against this binary.
 ///
 /// Not async and does not touch the store, scanner, or API — self-update
@@ -359,12 +380,7 @@ fn self_update(check_only: bool) -> anyhow::Result<()> {
 
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-s").arg("--");
-    if check_only {
-        cmd.arg("--check-only");
-    } else {
-        cmd.arg("--self-update").arg("--target-path").arg(&current_exe);
-    }
-    cmd.arg("--current-version").arg(env!("CARGO_PKG_VERSION"));
+    cmd.args(self_update_script_args(check_only, &current_exe));
     cmd.stdin(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().context("spawning sh to run the installer script")?;
@@ -449,4 +465,78 @@ fn init_tracing(filter: &str) -> anyhow::Result<dafs_api::LogLevelHandle> {
         })?;
 
     Ok(dafs_api::LogLevelHandle::new(handle, filter.to_string()))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// `dafs --watch a,b` must keep parsing exactly as it did before the
+    /// subcommand existed — no subcommand means `command` is `None` and
+    /// every existing flag lands in the flattened `Args`.
+    #[test]
+    fn no_subcommand_parses_flags_into_args_unchanged() {
+        let cli = Cli::try_parse_from([
+            "dafs",
+            "--watch",
+            "/a,/b",
+            "--listen",
+            "127.0.0.1:9999",
+            "--no-initial-scan",
+        ])
+        .expect("valid flags must parse");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.args.watch, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(cli.args.listen, "127.0.0.1:9999".parse().unwrap());
+        assert!(cli.args.no_initial_scan);
+    }
+
+    #[test]
+    fn no_arguments_at_all_uses_every_default() {
+        let cli = Cli::try_parse_from(["dafs"]).expect("bare invocation must parse");
+        assert!(cli.command.is_none());
+        assert!(cli.args.watch.is_empty());
+        assert_eq!(cli.args.data_dir, PathBuf::from("./.dafs"));
+        assert_eq!(cli.args.listen, "127.0.0.1:7878".parse().unwrap());
+        assert!(!cli.args.no_initial_scan);
+    }
+
+    #[test]
+    fn self_update_subcommand_parses() {
+        let cli = Cli::try_parse_from(["dafs", "self-update"]).expect("must parse");
+        assert!(matches!(cli.command, Some(Command::SelfUpdate { check_only: false })));
+    }
+
+    #[test]
+    fn self_update_check_only_flag_parses() {
+        let cli = Cli::try_parse_from(["dafs", "self-update", "--check-only"]).expect("must parse");
+        assert!(matches!(cli.command, Some(Command::SelfUpdate { check_only: true })));
+    }
+
+    /// A subcommand and the daemon's own flags are mutually exclusive by
+    /// construction (clap routes to one or the other), so a mistyped
+    /// combination should fail to parse rather than silently pick one.
+    #[test]
+    fn subcommand_and_watch_together_is_a_parse_error() {
+        let result = Cli::try_parse_from(["dafs", "self-update", "--watch", "/a"]);
+        assert!(result.is_err(), "self-update takes no daemon flags");
+    }
+
+    #[test]
+    fn check_only_passes_check_only_and_no_target_path() {
+        let args = self_update_script_args(true, std::path::Path::new("/usr/local/bin/dafs"));
+        assert_eq!(args[0], "--check-only");
+        assert!(!args.iter().any(|a| a == "--target-path"));
+        assert!(args.iter().any(|a| a == "--current-version"));
+    }
+
+    #[test]
+    fn real_update_passes_self_update_and_the_current_exe_path() {
+        let exe = std::path::Path::new("/usr/local/bin/dafs");
+        let args = self_update_script_args(false, exe);
+        assert_eq!(args[0], "--self-update");
+        assert_eq!(args[1], "--target-path");
+        assert_eq!(args[2], exe.as_os_str());
+    }
 }
