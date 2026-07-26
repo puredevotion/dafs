@@ -2,7 +2,7 @@
 //! I/O and no daemon knowledge beyond what `Status` already carries.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 
 use crate::capabilities::Capabilities;
 use crate::client::Status;
@@ -61,6 +61,7 @@ pub fn draw(
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Length(6),
         Constraint::Length(3),
         Constraint::Min(3),
@@ -68,9 +69,10 @@ pub fn draw(
     .split(area);
 
     draw_header(frame, chunks[0], url, status, caps);
-    draw_stats(frame, chunks[1], status, caps);
-    draw_sparkline(frame, chunks[2], rss_history, caps);
-    draw_events(frame, chunks[3], status, caps);
+    draw_watching(frame, chunks[1], status, caps);
+    draw_stats(frame, chunks[2], status, caps);
+    draw_sparkline(frame, chunks[3], rss_history, caps);
+    draw_events(frame, chunks[4], status, caps);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, url: &str, status: &Status, caps: Capabilities) {
@@ -91,6 +93,25 @@ fn draw_header(frame: &mut Frame, area: Rect, url: &str, status: &Status, caps: 
     let p = Paragraph::new(text)
         .style(Style::default().fg(color(caps, semantic)))
         .block(Block::default().borders(Borders::ALL).title(titled(caps, "🛰", "dafs-tui")));
+    frame.render_widget(p, area);
+}
+
+/// Always shown, connected or not — a stale daemon silently answering while
+/// a different one was meant to be watching something else is exactly the
+/// confusion this panel exists to prevent, so it never hides behind a
+/// "connect first" state.
+fn draw_watching(frame: &mut Frame, area: Rect, status: &Status, caps: Capabilities) {
+    let text = if !status.connected {
+        "-".to_string()
+    } else if status.watch_roots.is_empty() {
+        "(nothing yet)".to_string()
+    } else {
+        status.watch_roots.join(", ")
+    };
+
+    let p = Paragraph::new(text)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title(titled(caps, "📁", "watching")));
     frame.render_widget(p, area);
 }
 

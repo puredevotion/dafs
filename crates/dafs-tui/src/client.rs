@@ -36,6 +36,11 @@ struct EventsResp {
     events: Vec<TimelineItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WatchResp {
+    roots: Vec<String>,
+}
+
 /// A snapshot of everything the TUI shows, refreshed on every tick.
 ///
 /// Fetched as four independent requests rather than one combined call: there
@@ -55,6 +60,13 @@ pub struct Status {
     pub events_total: Option<u64>,
     pub files_known: Option<u64>,
     pub events: Vec<TimelineItem>,
+    /// Directories the daemon is currently watching. Always shown, not just
+    /// when empty — the whole point is that a user should never have to
+    /// wonder what a running daemon is actually pointed at, which is exactly
+    /// what caused the confusion this field exists to prevent (a stale
+    /// daemon and a new one watching different directories, indistinguishable
+    /// from the outside without asking it directly).
+    pub watch_roots: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -114,6 +126,15 @@ impl Client {
             .map(|r| r.events)
             .unwrap_or_default();
 
+        let watch_roots = self
+            .agent
+            .get(&self.url("/watch"))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<WatchResp>().ok())
+            .map(|r| r.roots)
+            .unwrap_or_default();
+
         Status {
             connected: true,
             ready,
@@ -124,6 +145,7 @@ impl Client {
             events_total: metrics.get("dafs_events_total").map(|v| *v as u64),
             files_known: metrics.get("dafs_files_known").map(|v| *v as u64),
             events,
+            watch_roots,
             error: None,
         }
     }

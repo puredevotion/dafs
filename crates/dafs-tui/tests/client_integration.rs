@@ -59,7 +59,7 @@ fn spawn_healthy_daemon() -> String {
     let addr = listener.local_addr().expect("local_addr");
 
     thread::spawn(move || {
-        for stream in listener.incoming().take(4) {
+        for stream in listener.incoming().take(5) {
             let Ok(mut stream) = stream else { continue };
             let path = request_path(&mut stream);
             match path.as_str() {
@@ -94,6 +94,9 @@ fn spawn_healthy_daemon() -> String {
                         {"id":1,"path":"/a","kind":"created","at_unix_ms":900,"is_dir":true}
                     ],"next_before_id":1}"#,
                 ),
+                "/watch" => {
+                    respond(stream, "200 OK", "application/json", r#"{"roots":["/home/u/docs"]}"#)
+                }
                 _ => respond(stream, "404 Not Found", "text/plain", "not found"),
             }
         }
@@ -142,6 +145,7 @@ fn a_healthy_daemon_produces_a_fully_populated_status() {
     assert_eq!(status.events.len(), 2);
     assert_eq!(status.events[0].path, "/a/b.txt");
     assert!(status.events[1].is_dir);
+    assert_eq!(status.watch_roots, vec!["/home/u/docs".to_string()]);
     assert!(status.error.is_none());
 }
 
