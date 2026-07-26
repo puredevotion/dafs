@@ -1,16 +1,27 @@
-# Automates the version bump / CHANGELOG / tag / draft release.
+# Automates the version bump / CHANGELOG / tag / release.
 #
-# release-please-config.json sets `skip-github-release: false` and `draft: true`:
-# release-please tags the version and opens the draft GitHub Release with the
-# generated changelog notes. release.yml (tag push trigger) then only attaches
-# build artifacts, an SBOM, and provenance attestations to that same release —
-# it does not create its own, which is what used to race `gh release create`
-# against a release-please release for the same tag.
+# release-please-config.json sets `skip-github-release: false`: release-please
+# tags the version and publishes the GitHub Release (with generated changelog
+# notes) immediately — not as a draft. release.yml (tag push trigger) then only
+# attaches build artifacts, an SBOM, and provenance attestations to that same
+# release — it does not create its own, which is what used to race
+# `gh release create` against a release-please release for the same tag.
 #
-# `skip-github-release: true` looks like the right knob for "let release.yml own
-# the release" but isn't: release-please's `buildRelease()` skips creating the tag
-# itself when that flag is set, not just the release notes, so nothing would ever
-# tag main and release.yml's tag-push trigger would never fire.
+# Two things NOT to set here, both tried and reverted in the same session:
+#
+# - `skip-github-release: true` looks like the right knob for "let release.yml
+#   own the release" but isn't: release-please's `buildRelease()` skips
+#   creating the tag itself when that flag is set, not just the release notes,
+#   so nothing would ever tag main and release.yml's tag-push trigger would
+#   never fire.
+#
+# - A per-package `draft: true` looks like the right way to let a human review
+#   before a release goes live, but a draft release doesn't create a real git
+#   tag ref until someone publishes it by hand. Without one, release-please's
+#   *own* next run can't find "the last release" via git tags either, so it
+#   re-proposes a release PR from scratch (re-listing already-released commits)
+#   on every subsequent push — it never converges. Publish immediately instead;
+#   review happens at the release-PR stage, before merge.
 name: release-please
 
 on:
