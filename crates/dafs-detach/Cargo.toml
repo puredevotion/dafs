@@ -1,0 +1,20 @@
+[package]
+name = "dafs-detach"
+description = "Double-fork daemonization for dafs --detach"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not published to crates.io: see dafs-alloc's Cargo.toml for why.
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+# `daemonize` (the obvious alternative) is RUSTSEC-2025-0069, unmaintained
+# with no safe upgrade — cargo-deny catches this in CI and it stays caught.
+# `nix` is one of the most actively maintained low-level POSIX crates in the
+# ecosystem; this crate exists so dafs-daemon's `forbid(unsafe_code)` never
+# has to be touched to use it — see lib.rs for where the one truly unsafe
+# call (fork) actually lives.
+nix = { version = "0.29", default-features = false, features = ["process", "fs"] }

@@ -1,0 +1,53 @@
+# OWASP ZAP baseline rule configuration for the DAFS API.
+#
+# Format: <rule id>	<action>	<comment>
+# Actions: WARN (report, do not fail), IGNORE (do not report), FAIL.
+#
+# Every IGNORE here is a deliberate decision with a reason, not a way to get a
+# green run. An alert that is genuinely inapplicable to this surface is noise
+# that trains the reader to skim; an alert that is applicable stays.
+#
+# The daemon binds loopback and is unauthenticated by design — see the daemon's
+# --listen default and dafs_api::logging. That pairing is documented, so the
+# alerts that restate it are ignored. What this scan is actually looking for is
+# the accidental kind: a reflected parameter, a header leaking a filesystem
+# path, a crash on a malformed query.
+#
+# If the bind address is ever widened, revisit this entire file: most of the
+# reasoning below stops holding the moment the API is reachable off-host.
+
+# Content Security Policy. The UI is a single self-contained page with inlined
+# script and style, which is what makes the daemon one deployable artifact; a
+# meaningful CSP for it would need hashes regenerated on every build. Worth
+# doing when the page loads anything it did not ship with — today it does not.
+10038	WARN	CSP header not set — single self-contained page, revisit if it ever loads external content
+
+# Anti-clickjacking / X-Frame-Options. Framing a loopback-only page that
+# displays the local user's own file listing to that same local user is not a
+# meaningful attack path.
+10020	IGNORE	Loopback-only UI; framing yields nothing the viewer cannot already see
+
+# X-Content-Type-Options. Every response sets an explicit Content-Type, so
+# sniffing has nothing to guess at. Cheap to add regardless — tracked, not
+# ignored.
+10021	WARN	Explicit Content-Type on every route; worth adding the header anyway
+
+# HTTPS-related alerts. The API is plain HTTP on loopback deliberately: TLS to
+# 127.0.0.1 protects against nothing and would require a certificate the daemon
+# has no way to obtain. Peer traffic from M05 onward is a separate surface and
+# is mutually authenticated and encrypted from its first line of code.
+10035	IGNORE	HSTS is meaningless on a loopback HTTP listener
+10063	IGNORE	Permissions-Policy: no browser feature is used by this page
+
+# Cache headers. The timeline is local, non-sensitive to the local user, and
+# already refetched every five seconds by the page itself.
+10015	IGNORE	Local-only content, polled continuously; caching directives add nothing
+10049	IGNORE	Same
+
+# Information disclosure via the server banner. Worth knowing about if it ever
+# starts reporting a version, so this stays a warning rather than an ignore.
+10036	WARN	Watch for a version-bearing Server header
+
+# Timestamp disclosure. /version and /metrics report uptime and event
+# timestamps because that is their purpose.
+10096	IGNORE	Timestamps are the intended content of /version and /metrics

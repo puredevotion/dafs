@@ -4,10 +4,11 @@ A distributed, AI-native filesystem. Local-first, content-addressed,
 peer-to-peer, with files treated as part of a personal knowledge graph rather
 than isolated blobs in folders.
 
-> **Status: pre-alpha.** M00 (walking skeleton) is in: the daemon starts, migrates
-> its metadata store, serves a small HTTP API, and shuts down cleanly. It does not
-> yet watch, index, search, or sync anything — that starts at M01. Do not depend
-> on this.
+> **Status: pre-alpha.** M01 (local timeline) is in: point the daemon at a
+> directory and it records what changes there, served as a timeline you can read
+> in a browser. It is strictly read-only — it never modifies the files it
+> observes. It does not yet extract metadata, search, or sync anything. Do not
+> depend on this.
 
 ## What it is meant to be
 
@@ -58,7 +59,8 @@ read-only)
 | | Milestone | What you get |
 |---|---|---|
 | M00 | Walking skeleton + CI | *(nothing — scaffolding and the test gate)* ✅ |
-| M01 | Local timeline | "What did I work on today?" |
+| M01 | Local timeline | "What did I work on today?" ✅ |
+| M01a | Ship it | Install without building from source, watch it running, update it in place |
 | M02a | Deterministic metadata + browse | Filter and skim by real document properties |
 | M02b | Local LLM enrichment | Summaries, keywords, entities |
 | M03 | Semantic search | Find things without remembering filenames |
@@ -113,11 +115,57 @@ corpus is not in this repository and cannot be — it's referenced by content
 hash from a manifest, so published numbers name exactly which revision produced
 them.
 
+## Installing
+
+Prebuilt Linux binaries (x86_64, aarch64) are attached to each
+[release](https://github.com/puredevotion/dafs/releases):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/puredevotion/dafs/main/scripts/install.sh | sh
+```
+
+That pipes a script straight into your shell — inspect it first if you'd
+rather not do that blind:
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/puredevotion/dafs/main/scripts/install.sh
+less install.sh   # read it
+sh install.sh
+```
+
+It downloads the matching release tarball, verifies its sha256 checksum
+before extracting anything, and installs to `~/.local/bin/dafs`
+(override with `DAFS_INSTALL_DIR`). Pin a specific version with
+`sh install.sh --version v0.0.1`.
+
 ## Building
 
 ```sh
 cargo build --release -p dafs-daemon
-./target/release/dafs             # serves http://127.0.0.1:7878
+./target/release/dafs --watch ~/Documents    # observe a directory, in the background
+open http://127.0.0.1:7878                   # read the timeline
+```
+
+With no `--watch` it starts, serves an empty timeline, and observes nothing —
+a daemon that began indexing a home directory nobody pointed it at would be a
+surprise.
+
+`dafs` detaches into the background by default, logging to
+`<data-dir>/dafs.log` instead of the terminal — a foreground daemon sharing a
+terminal with another tool (`dafs-tui`, say) would have its log output land
+in whatever that tool is rendering. Pass `--detach false` to stay in the
+foreground instead (debugging, or under a supervisor that already manages the
+process). Either way, `dafs stop [--data-dir ...]` stops it, and a second
+`dafs --watch X` against the same `--data-dir` reconfigures the running one
+(`--on-running=add|replace`) rather than failing to bind.
+
+The frontend lives in `ui/` and is built with Vite. Its output
+(`ui/dist/index.html`, one self-contained file) is **committed**, because the
+Rust build has to work with no network and an `npm ci` in front of `cargo build`
+would break that. CI rebuilds it and fails if the committed copy is stale.
+
+```sh
+cd ui && npm ci && npm run build    # after changing anything under ui/src
 ```
 
 Or with Nix:
@@ -135,9 +183,10 @@ deliberate — widening the bind address is a decision for whoever adds auth.
 
 | Crate | |
 |---|---|
-| `dafs-daemon` | the binary: startup ordering, signal handling, CLI |
-| `dafs-api` | HTTP surface and the embedded UI shell |
-| `dafs-store` | SQLite schema, migrations, connection tuning |
+| `dafs-daemon` | the binary: startup ordering, signal handling, CLI, the observer thread |
+| `dafs-api` | HTTP surface and the embedded UI |
+| `dafs-scan` | filesystem observer: initial scan and live watch |
+| `dafs-store` | SQLite schema, migrations, path interning, the event log |
 | `dafs-alloc` | allocator selection and RSS measurement |
 | `dafs-memtest` | RSS ceiling assertions against the release binary |
 
@@ -178,10 +227,16 @@ point of this being public.
 
 The daemon's idle RSS ceiling is **32 MiB**, asserted in CI against the release
 binary from M00 onward, and exported as `dafs_resident_bytes` on `/metrics` so
-it is observable in a running deployment rather than only in tests. Current
-measured idle: **~6 MiB**. See [`docs/memory-budget.md`](docs/memory-budget.md)
-for the full budget, the allocator tuning it depends on, and which technique is
-due at which milestone.
+it is observable in a running deployment rather than only in tests.
+
+From M01 the scan has its own requirement, and it is the stronger one: peak
+memory must be **independent of corpus size**, not merely under a number on one
+corpus — a scan that accumulates per-file state passes a single-size check on a
+small tree and fails on a real one. Measured at 9.35 MiB for 64k files and
+9.36 MiB for 128k: 1.00x growth for a 2x corpus.
+
+See [`docs/memory-budget.md`](docs/memory-budget.md) for the full budget, the
+allocator tuning it depends on, and which technique is due at which milestone.
 
 ## Contributing
 

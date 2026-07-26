@@ -25,11 +25,22 @@
 //	dagger call audit          --source=..
 //	dagger call fuzz           --source=.. --seconds=60
 //	dagger call private-refs   --source=..
+//	dagger call ui-bundle      --source=..     # rebuild the UI, diff vs committed
+//	dagger call dast           --source=..     # scanners against a live daemon
 //	dagger call image          --source=..     # OCI container
+//	dagger call build          --source=.. --target=x86_64-unknown-linux-gnu  # release tarball + sha256
+//	dagger call sbom           --source=..     # CycloneDX SBOM per crate
 //
 // `image` returns a Container rather than pushing it. Pushing needs credentials
 // that are specific to whoever is deploying — this module stays credential-free
 // so it can run anywhere, and the push is the caller's step.
+//
+// `build` and `sbom` mirror the `build`/`sbom` jobs in release.yml: same target
+// matrix, same strip-then-package steps, same cargo-cyclonedx invocation. They
+// exist here so a release artifact is reproducible on any machine with Dagger,
+// not only inside GitHub Actions — the same reason the rest of this module
+// exists. `publish` (cutting the GitHub Release itself) stays GitHub-only: it is
+// the one step that is genuinely tied to that forge.
 package main
 
 import (
@@ -45,6 +56,13 @@ import (
 const (
 	rustImage    = "rust:1.97-bookworm"
 	nightlyImage = "rustlang/rust:nightly-bookworm"
+	// Frontend builds only. Node appears nowhere in the daemon's own build —
+	// the UI bundle is committed, so `cargo build` and `nix build` need no
+	// JavaScript toolchain at all. See UiBundle.
+	nodeImage = "node:22-alpine"
+	// Dynamic scanning. ZAP's baseline is driven from the GitHub workflow,
+	// which has a maintained action for it; nuclei runs in both places.
+	nucleiImage = "projectdiscovery/nuclei:latest"
 	// Distroless: no shell, no package manager, and it carries CA certificates,
 	// which the daemon will need once it talks to peers.
 	runtimeImage = "gcr.io/distroless/cc-debian12:nonroot"
@@ -132,7 +150,22 @@ func (m *DafsCi) Audit(ctx context.Context, source *dagger.Directory) (string, e
 		Stdout(ctx)
 }
 
-// Fuzz runs the metadata-store fuzz target for `seconds`.
+// fuzzTargets is every target in fuzz/Cargo.toml.
+//
+// Listed here rather than discovered, so adding a target to the fuzz crate
+// without wiring it into CI is a visible omission in this file rather than a
+// target that silently never runs. Kept in lockstep with the fuzz-smoke job in
+// the GitHub workflow.
+var fuzzTargets = []string{
+	// The store against a corrupted database file.
+	"migrations",
+	// Path interning against arbitrary filename bytes. On Unix any sequence
+	// but NUL and `/` is a legal component, so invalid UTF-8 and
+	// traversal-shaped names arrive from simply scanning a directory.
+	"paths",
+}
+
+// Fuzz runs every fuzz target for `seconds` each.
 //
 // Nightly, because cargo-fuzz needs it. A short run per push is not a campaign;
 // it catches a target that has stopped building and the occasional shallow
@@ -141,11 +174,16 @@ func (m *DafsCi) Fuzz(ctx context.Context, source *dagger.Directory, seconds int
 	if seconds <= 0 {
 		seconds = 60
 	}
-	return m.rustBase(source, nightlyImage).
-		WithExec([]string{"cargo", "install", "cargo-fuzz", "--locked"}).
-		WithExec([]string{"cargo", "fuzz", "run", "migrations", "--",
-			fmt.Sprintf("-max_total_time=%d", seconds)}).
-		Stdout(ctx)
+
+	container := m.rustBase(source, nightlyImage).
+		WithExec([]string{"cargo", "install", "cargo-fuzz", "--locked"})
+
+	for _, target := range fuzzTargets {
+		container = container.WithExec([]string{"cargo", "fuzz", "run", target, "--",
+			fmt.Sprintf("-max_total_time=%d", seconds)})
+	}
+
+	return container.Stdout(ctx)
 }
 
 // PrivateRefs scans for internal hostnames and private address ranges.
@@ -182,6 +220,90 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 		Stdout(ctx)
 }
 
+// Dast runs dynamic scanners against a live daemon.
+//
+// Scoped to milestones that actually have an HTTP surface — three in the whole
+// roadmap — rather than listed against every one. M01's timeline API is the
+// first, so this exists from here and not before.
+//
+// The daemon binds loopback and is unauthenticated by design, so "no auth" is
+// not the finding this looks for. It is the accidental kind: a reflected value,
+// a header leaking a path, an unbounded request body. The M01 pass found the
+// last of those — a 2 MB log-filter payload accepted with a 200.
+//
+// Kept in lockstep with the `dast` job in the GitHub workflow.
+func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, error) {
+	daemon := m.rustBase(source, rustImage).
+		WithExec([]string{"cargo", "build", "--release", "-p", "dafs-daemon"}).
+		WithExec([]string{"cp", "/src/target/release/dafs", "/dafs"})
+
+	// A corpus, so the scan has something to find. A scanner pointed at an
+	// empty timeline passes trivially, which is worse than not running it.
+	service := dag.Container().
+		From(runtimeImage).
+		WithFile("/dafs", daemon.File("/dafs")).
+		WithEnvVariable("DAFS_LISTEN", "0.0.0.0:7878").
+		WithEnvVariable("DAFS_DATA_DIR", "/tmp/data").
+		WithEnvVariable("DAFS_WATCH", "/tmp/corpus").
+		WithDirectory("/tmp/corpus", dag.Directory().
+			WithNewFile("note.md", "hello").
+			WithNewFile("docs/readme.txt", "world")).
+		WithExposedPort(7878).
+		AsService()
+
+	return dag.Container().
+		From(nucleiImage).
+		WithServiceBinding("dafs", service).
+		// Fail the check only on findings that are actually actionable;
+		// informational output on an unauthenticated local API is noise.
+		WithExec([]string{"nuclei", "-target", "http://dafs:7878",
+			"-severity", "critical,high,medium"}).
+		Stdout(ctx)
+}
+
+// UiBundle rebuilds the frontend and asserts the committed bundle matches.
+//
+// `ui/dist/index.html` is committed and embedded into the daemon with
+// include_str!, because the Rust build has to work with no network and an
+// `npm ci` in front of `cargo build` would break Hermetic. The risk that buys
+// is a committed artifact drifting from its source; this removes it by
+// rebuilding and diffing.
+//
+// Kept in lockstep with the `ui-bundle` job in the GitHub workflow.
+func (m *DafsCi) UiBundle(ctx context.Context, source *dagger.Directory) (string, error) {
+	// `npm ci` rather than `npm install`: it installs exactly the lockfile and
+	// fails if package.json and the lock disagree, which is what makes the
+	// rebuild reproducible rather than merely likely.
+	//
+	// The single-file assertion matters because the daemon serves one string
+	// and has no route for sibling assets — a build emitting a separate .js or
+	// .css would render a blank page in production while every Rust test passed.
+	script := `set -e
+npm ci --prefix ui
+npm run build --prefix ui
+count=$(find ui/dist -type f | wc -l)
+if [ "$count" -ne 1 ]; then
+  echo "ui/dist must contain exactly one file, found $count"
+  find ui/dist -type f
+  exit 1
+fi
+if ! git diff --quiet -- ui/dist; then
+  echo "ui/dist is out of date — run 'npm run build' in ui/ and commit the result"
+  git diff --stat -- ui/dist
+  exit 1
+fi
+echo "committed bundle matches a fresh build, and is a single file"`
+
+	return dag.Container().
+		From(nodeImage).
+		// git is needed for the diff below and is not in the base node image.
+		WithExec([]string{"apk", "add", "--no-cache", "git"}).
+		WithMountedDirectory("/src", source).
+		WithWorkdir("/src").
+		WithExec([]string{"sh", "-c", script}).
+		Stdout(ctx)
+}
+
 // Image builds the runtime container.
 //
 // Returns the Container rather than pushing it: a push needs registry
@@ -210,6 +332,72 @@ func (m *DafsCi) Image(source *dagger.Directory) *dagger.Container {
 		WithEntrypoint([]string{"/dafs"})
 }
 
+// releaseTargets maps a Rust target triple to the asset name release.yml
+// publishes it under. Kept in lockstep with the `build` job's matrix there —
+// a target added to one belongs in the other.
+var releaseTargets = map[string]string{
+	"x86_64-unknown-linux-gnu":  "dafs-x86_64-linux",
+	"aarch64-unknown-linux-gnu": "dafs-aarch64-linux",
+}
+
+// Build cross-compiles the release daemon for `target`, strips it, and
+// packages it exactly as release.yml's `build` job does: a `.tar.gz` plus a
+// detached `.tar.gz.sha256`, both returned in the output directory.
+//
+// Stripping happens here rather than via the release profile, for the same
+// reason release.yml does it in packaging: cargo applies profile-level
+// `strip` to build-script and proc-macro binaries too, and stripping those is
+// a route to obscure build failures. Doing it here affects only the artifact
+// actually shipped.
+func (m *DafsCi) Build(ctx context.Context, source *dagger.Directory, target string) (*dagger.Directory, error) {
+	name, ok := releaseTargets[target]
+	if !ok {
+		return nil, fmt.Errorf("unsupported target %q (known: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu)", target)
+	}
+
+	container := m.rustBase(source, rustImage).
+		WithExec([]string{"rustup", "target", "add", target})
+
+	stripBin := "strip"
+	if target == "aarch64-unknown-linux-gnu" {
+		// jemalloc and bundled SQLite are C, so cross-compiling needs a cross
+		// linker and compiler too, not just a Rust target — same as release.yml.
+		container = container.
+			WithExec([]string{"apt-get", "update"}).
+			WithExec([]string{"apt-get", "install", "-y", "gcc-aarch64-linux-gnu"}).
+			WithEnvVariable("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", "aarch64-linux-gnu-gcc").
+			WithEnvVariable("CC_aarch64_unknown_linux_gnu", "aarch64-linux-gnu-gcc")
+		stripBin = "aarch64-linux-gnu-strip"
+	}
+
+	container = container.WithExec([]string{"cargo", "build", "--release", "-p", "dafs-daemon", "--target", target})
+
+	binPath := fmt.Sprintf("/src/target/%s/release/dafs", target)
+	script := fmt.Sprintf(`set -e
+%s %s
+mkdir -p /out
+tar -czf /out/%s.tar.gz -C "$(dirname %s)" dafs
+sha256sum /out/%s.tar.gz > /out/%s.tar.gz.sha256
+`, stripBin, binPath, name, binPath, name, name)
+
+	container = container.WithExec([]string{"sh", "-c", script})
+	return container.Directory("/out"), nil
+}
+
+// Sbom generates a CycloneDX SBOM for every crate in the workspace, mirroring
+// release.yml's `sbom` job.
+func (m *DafsCi) Sbom(ctx context.Context, source *dagger.Directory) *dagger.Directory {
+	script := `set -e
+cargo cyclonedx --format json --all
+mkdir -p /out
+find . -name '*.cdx.json' -not -path './target/*' -exec cp {} /out/ \;
+`
+	container := m.rustBase(source, rustImage).
+		WithExec([]string{"cargo", "install", "cargo-cyclonedx", "--locked"}).
+		WithExec([]string{"sh", "-c", script})
+	return container.Directory("/out")
+}
+
 // Check runs the whole suite concurrently and reports a per-check verdict.
 //
 // Every check runs even when an earlier one fails, and the failures are
@@ -233,6 +421,8 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory) (string, e
 		{"rss-ceiling", func() error { _, e := m.RssCeiling(ctx, source); return e }},
 		{"audit", func() error { _, e := m.Audit(ctx, source); return e }},
 		{"private-refs", func() error { _, e := m.PrivateRefs(ctx, source); return e }},
+		{"ui-bundle", func() error { _, e := m.UiBundle(ctx, source); return e }},
+		{"dast", func() error { _, e := m.Dast(ctx, source); return e }},
 		{"fuzz", func() error { _, e := m.Fuzz(ctx, source, 30); return e }},
 	}
 

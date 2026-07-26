@@ -1,0 +1,284 @@
+/* Light and dark both, driven by the OS. A tool that lives in a browser tab all
+   day should not be the one window that is the wrong colour. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --line: #e4e4e4;
+  --accent: #2563eb;
+  --bad: #c00000;
+
+  --created: #15803d;
+  --modified: #b45309;
+  --deleted: #b91c1c;
+  --renamed: #6d28d9;
+
+  --created-bg: #dcfce7;
+  --modified-bg: #fef3c7;
+  --deleted-bg: #fee2e2;
+  --renamed-bg: #ede9fe;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --fg: #e8e8e8;
+    --muted: #9a9a9a;
+    --line: #2c2f36;
+    --accent: #60a5fa;
+    --bad: #f87171;
+
+    --created: #4ade80;
+    --modified: #fbbf24;
+    --deleted: #f87171;
+    --renamed: #c4b5fd;
+
+    --created-bg: #14351f;
+    --modified-bg: #3a2c0c;
+    --deleted-bg: #3d1717;
+    --renamed-bg: #2a1f47;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+  max-width: 62rem;
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+h1 {
+  font-size: 1.4rem;
+  margin: 0;
+}
+
+.sub {
+  margin: 0.15rem 0 1.5rem;
+  color: var(--muted);
+}
+
+/* Status strip */
+
+.status {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.status dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.5rem 1.5rem;
+  margin: 0;
+}
+
+.status dt {
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.status dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.bad {
+  color: var(--bad);
+}
+
+/* Filters */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.filters button {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.filters button:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.filters button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* Keep keyboard focus visible — the filters are the one interactive control
+   here, and a ring removed for looks is a control nobody can tab to. */
+.filters button:focus-visible,
+.more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Timeline */
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.day {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 1.25rem 0 0.4rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.day:first-child {
+  margin-top: 0;
+}
+
+.event {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr auto;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.4rem 0.25rem;
+  border-radius: 6px;
+}
+
+.event:hover {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.kind {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-align: center;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.kind-created {
+  color: var(--created);
+  background: var(--created-bg);
+}
+.kind-modified {
+  color: var(--modified);
+  background: var(--modified-bg);
+}
+.kind-deleted {
+  color: var(--deleted);
+  background: var(--deleted-bg);
+}
+.kind-renamed {
+  color: var(--renamed);
+  background: var(--renamed-bg);
+}
+
+/* The filename is what the eye is looking for; the directory is context. */
+.path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dir {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.name {
+  font-weight: 500;
+}
+
+.from {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.meta {
+  display: flex;
+  gap: 0.9rem;
+  color: var(--muted);
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Messages and paging */
+
+.message {
+  color: var(--muted);
+  padding: 2rem 0;
+  text-align: center;
+}
+
+.message.error {
+  color: var(--bad);
+}
+
+.message code {
+  font-size: 0.9em;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+.more {
+  display: block;
+  margin: 1.5rem auto 0;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.45rem 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.more:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.more:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* On a narrow screen the three-column row does not fit; stack it. */
+@media (max-width: 34rem) {
+  .event {
+    grid-template-columns: 5.5rem 1fr;
+  }
+
+  .meta {
+    grid-column: 2;
+  }
+}

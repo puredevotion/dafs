@@ -18,7 +18,10 @@ publish = false
 dafs-alloc = { path = "../dafs-alloc" }
 axum.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

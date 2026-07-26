@@ -58,6 +58,58 @@ jobs:
         working-directory: fuzz
         run: cargo check
 
+  ui-bundle:
+    # `ui/dist/index.html` is committed and embedded into the daemon with
+    # include_str!, because the Rust build has to work with no network and an
+    # `npm ci` in front of `cargo build` would break that (see the `hermetic`
+    # job below).
+    #
+    # The risk that buys is a committed artifact drifting from its source. This
+    # job removes it: rebuild from ui/src and fail if the result differs from
+    # what is in the tree. So the bundle is reproducible, and a PR that edits
+    # the frontend without rebuilding cannot merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile and
+      # fails if package.json and the lock disagree, which is what makes the
+      # rebuild below reproducible rather than merely likely.
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Rebuild the bundle
+        working-directory: ui
+        run: npm run build
+
+      - name: Fail if the committed bundle is stale
+        run: |
+          if ! git diff --quiet -- ui/dist; then
+            echo "::error::ui/dist is out of date — run 'npm run build' in ui/ and commit the result"
+            git diff --stat -- ui/dist
+            exit 1
+          fi
+          echo "committed bundle matches a fresh build"
+
+      # The daemon serves exactly one file and has no route for sibling assets,
+      # so a build that emitted a separate .js or .css would render a blank page
+      # in production while every Rust test still passed.
+      - name: Assert the bundle is a single self-contained file
+        run: |
+          count=$(find ui/dist -type f | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::ui/dist must contain exactly one file, found $count"
+            find ui/dist -type f
+            exit 1
+          fi
+          echo "bundle is a single file"
+
   memory-budget:
     # The RSS ceiling from docs/memory-budget.md, asserted against the release
     # binary. Separate job because it needs a release build, which is slow and
@@ -127,12 +179,86 @@ jobs:
       - name: Fuzz the metadata store (60s)
         run: cargo fuzz run migrations -- -max_total_time=60
 
+      # Filenames are bytes the user did not type: on Unix anything but NUL and
+      # `/` is a legal component, so invalid UTF-8 and traversal-shaped names
+      # arrive from nothing more exotic than scanning a directory.
+      - name: Fuzz path interning (60s)
+        run: cargo fuzz run paths -- -max_total_time=60
+
       - name: Upload crashers
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
+
+  dast:
+    # Dynamic scanning against a running daemon.
+    #
+    # The testing bar scopes DAST to milestones that actually have an HTTP
+    # surface — three in the whole roadmap — and M01's timeline API is the
+    # first. Listing it against a milestone with no server produces a checkbox
+    # nobody can honestly tick, so this job exists from here and not before.
+    #
+    # The daemon binds loopback and is unauthenticated by design, so the finding
+    # this is looking for is not "no auth" — that is a known, documented
+    # pairing. It is the accidental kind: a reflected value, a header that
+    # leaks a path, a crash on a malformed query.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the daemon
+        run: cargo build --release -p dafs-daemon
+
+      - name: Start it against a small corpus
+        run: |
+          mkdir -p /tmp/dast-corpus/docs /tmp/dast-data
+          echo "hello" > /tmp/dast-corpus/docs/note.md
+          echo "world" > /tmp/dast-corpus/readme.txt
+          # 0.0.0.0 so the scanner containers can reach it. Acceptable only
+          # because this is an ephemeral CI runner; the daemon's own default
+          # stays loopback.
+          ./target/release/dafs \
+            --listen 0.0.0.0:7878 \
+            --data-dir /tmp/dast-data \
+            --watch /tmp/dast-corpus \
+            --log info &
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:7878/readyz > /dev/null; then
+              echo "daemon ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::daemon did not become ready"; exit 1
+
+      - name: Confirm there is something to scan
+        # A scanner pointed at an empty timeline passes trivially. Fail loudly
+        # rather than report a clean run against no data.
+        run: |
+          events=$(curl -sf http://127.0.0.1:7878/events | grep -o '"id"' | wc -l)
+          echo "timeline has $events events"
+          [ "$events" -gt 0 ] || { echo "::error::no events to scan against"; exit 1; }
+
+      - name: OWASP ZAP baseline
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://127.0.0.1:7878
+          rules_file_name: .zap/rules.tsv
+          # Report, do not fail the build on warnings. ZAP's baseline flags
+          # missing security headers on every unauthenticated local API, and a
+          # gate that always fails is a gate everyone learns to ignore. Errors
+          # (an actual vulnerability rule) still fail.
+          cmd_options: "-a"
+          allow_issue_writing: false
+
+      - name: nuclei
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: http://127.0.0.1:7878
+          flags: "-severity critical,high,medium"
 
   no-private-references:
     # Structural counterpart to the hermetic build: catch internal hostnames and
