@@ -65,6 +65,16 @@ jobs:
           [ "$bad" -eq 0 ] || exit 1
           echo "all commit subjects are Conventional Commits"
 
+  cargo-versions:
+    # release-please's cargo-workspace plugin needs a literal semver in every
+    # member's [package.version] — see scripts/check-crate-versions.sh for the
+    # incident this guards against.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check crate manifest versions
+        run: ./scripts/check-crate-versions.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
