@@ -93,7 +93,7 @@ struct Pending {
 /// Owns a background thread from `notify` plus the debounce state. Dropping it
 /// stops the watch.
 pub struct Watch {
-    _watcher: notify::RecommendedWatcher,
+    watcher: notify::RecommendedWatcher,
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
     pending: HashMap<PathBuf, Pending>,
     /// Halves of a rename waiting for their partner, keyed by the kernel's
@@ -127,12 +127,30 @@ impl Watch {
         }
 
         Ok(Self {
-            _watcher: watcher,
+            watcher,
             rx,
             pending: HashMap::new(),
             pending_renames: HashMap::new(),
             overflowed: false,
         })
+    }
+
+    /// Start watching an additional root, live.
+    ///
+    /// Does not scan it — the caller does that first (there is no way to know
+    /// what already exists in a newly added root except by walking it), then
+    /// calls this so subsequent changes are picked up too. Ordering the other
+    /// way risks a change landing between the scan finishing and the watch
+    /// starting and being silently missed.
+    pub fn add_root(&mut self, root: &Path) -> notify::Result<()> {
+        self.watcher.watch(root, RecursiveMode::Recursive)
+    }
+
+    /// Stop watching a root, live. Past events already recorded for it are
+    /// untouched — this only stops future ones, the same as if it had never
+    /// been passed to `--watch` this run.
+    pub fn remove_root(&mut self, root: &Path) -> notify::Result<()> {
+        self.watcher.unwatch(root)
     }
 
     /// Collect changes whose debounce window has expired.
@@ -504,6 +522,49 @@ mod tests {
         assert!(
             !watch.poll(Duration::from_millis(10)).contains(&Change::Overflowed),
             "an overflow should be reported once, not latch forever"
+        );
+    }
+
+    #[test]
+    fn a_root_added_live_is_watched() {
+        let original = tempfile::tempdir().expect("tempdir");
+        let added = tempfile::tempdir().expect("tempdir");
+        let mut watch = Watch::new(&[original.path().to_path_buf()]).expect("watch");
+
+        watch.add_root(added.path()).expect("add_root");
+        std::fs::write(added.path().join("b.txt"), "hello").expect("write");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut changes = Vec::new();
+        while Instant::now() < deadline && changes.is_empty() {
+            changes = watch.poll(Duration::from_millis(200));
+        }
+
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::Touched(p) if p.ends_with("b.txt"))),
+            "expected a Touched event from the root added live, got {changes:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_root_stops_producing_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut watch = Watch::new(&[dir.path().to_path_buf()]).expect("watch");
+
+        watch.remove_root(dir.path()).expect("remove_root");
+        std::fs::write(dir.path().join("c.txt"), "hello").expect("write");
+
+        // Bounded wait rather than a fixed sleep: give a false report every
+        // chance to arrive, then assert it didn't.
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let mut changes = Vec::new();
+        while Instant::now() < deadline {
+            changes.extend(watch.poll(Duration::from_millis(100)));
+        }
+
+        assert!(
+            changes.is_empty(),
+            "a removed root should produce no more changes, got {changes:?}"
         );
     }
 }
