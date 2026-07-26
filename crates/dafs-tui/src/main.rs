@@ -50,8 +50,18 @@ fn main() -> anyhow::Result<()> {
     let refresh = Duration::from_millis(args.refresh_ms.max(100));
     let caps = Capabilities::detect();
 
-    let mut terminal = ratatui::init();
+    // Checked *before* entering the alternate screen: a daemon that never
+    // answers must fail as a plain, readable message on the normal terminal,
+    // not as a raw-mode dashboard sitting empty (or, worse, a startup error
+    // from the daemon racing the terminal for the same tty and corrupting
+    // both — this is exactly the failure a user hit in practice).
     let mut status = client.poll(args.limit);
+    if !status.connected {
+        eprintln!("{}", unreachable_message(&args.url, status.error.as_deref()));
+        std::process::exit(1);
+    }
+
+    let mut terminal = ratatui::init();
     let mut rss_history: VecDeque<u64> = VecDeque::with_capacity(RSS_HISTORY_LEN);
     push_rss_sample(&mut rss_history, &status);
     let mut last_poll = Instant::now();
@@ -90,6 +100,23 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// The message printed when the initial poll can't reach a daemon at all.
+/// Pure and separate from `main` so its wording is unit-testable without
+/// exiting a process.
+fn unreachable_message(url: &str, reason: Option<&str>) -> String {
+    let reason = reason.unwrap_or("connection failed");
+    format!(
+        "dafs-tui: can't reach a dafs daemon at {url}\n  ({reason})\n\n\
+         Is one running? Start it, then try again:\n  \
+         dafs --watch <a directory> &\n\n\
+         Already running somewhere else? Point at it:\n  \
+         dafs-tui --url http://host:port\n\n\
+         Already running on this port but not answering? Something else may \
+         hold it — check with `lsof -i :7878` (or the port in --url) and \
+         free it before retrying."
+    )
+}
+
 /// Append the latest RSS sample, dropping the oldest once the window is full.
 /// A missed sample (daemon unreachable this tick) is skipped rather than
 /// recorded as zero, so a disconnect blank rather than a fake trough.
@@ -99,4 +126,24 @@ fn push_rss_sample(history: &mut VecDeque<u64>, status: &client::Status) {
         history.pop_front();
     }
     history.push_back(rss);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_message_names_the_url_and_a_fix() {
+        let msg = unreachable_message("http://127.0.0.1:7878", Some("connection refused"));
+        assert!(msg.contains("http://127.0.0.1:7878"));
+        assert!(msg.contains("connection refused"));
+        assert!(msg.contains("dafs --watch"), "should suggest starting the daemon");
+        assert!(msg.contains("--url"), "should mention pointing at a different daemon");
+    }
+
+    #[test]
+    fn unreachable_message_has_a_fallback_reason() {
+        let msg = unreachable_message("http://127.0.0.1:7878", None);
+        assert!(msg.contains("connection failed"));
+    }
 }
