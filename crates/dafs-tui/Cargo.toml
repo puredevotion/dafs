@@ -1,0 +1,27 @@
+[package]
+name = "dafs-tui"
+description = "Read-only terminal status monitor for a running dafs daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not published to crates.io: see dafs-alloc's Cargo.toml for why.
+publish = false
+
+[[bin]]
+name = "dafs-tui"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
+# TLS off: this talks to a loopback HTTP daemon, and pulling in a TLS stack
+# for a status client that never needs one is exactly the kind of dependency
+# weight the rest of this workspace avoids. `json` enables `Response::into_json`.
+ureq = { version = "2", default-features = false, features = ["json"] }
