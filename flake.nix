@@ -114,6 +114,9 @@
           shellHook = ''
             echo "dafs dev shell — cargo $(cargo --version | cut -d' ' -f2)"
             echo "fuzzing needs nightly: cargo +nightly fuzz run migrations"
+            if [ -d .git ]; then
+              ./scripts/install-hooks.sh
+            fi
           '';
         };
 

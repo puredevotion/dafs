@@ -17,6 +17,7 @@
 // Every function here is runnable locally with no credentials:
 //
 //	dagger call check          --source=..     # everything, in parallel
+//	dagger call commit-lint    --source=.. --base=main  # Conventional Commits since base
 //	dagger call test           --source=..
 //	dagger call lint           --source=..
 //	dagger call fmt-check      --source=..
@@ -86,6 +87,43 @@ func (m *DafsCi) rustBase(source *dagger.Directory, image string) *dagger.Contai
 		// local iteration is not painful.
 		WithEnvVariable("RUSTFLAGS", "-D warnings").
 		WithEnvVariable("CARGO_TERM_COLOR", "always")
+}
+
+// CommitLint asserts every commit subject in `base..HEAD` is a Conventional
+// Commit. `base` defaults to "main" if empty.
+//
+// release-please (release-please.yml) derives the version bump and
+// CHANGELOG.md entry from these subjects; a commit it can't parse is silently
+// excluded rather than erroring, which is how v0.0.1 shipped with an empty
+// changelog. Kept in lockstep with the commit-lint job in the GitHub workflow
+// and the local commit-msg hook in .githooks/.
+func (m *DafsCi) CommitLint(ctx context.Context, source *dagger.Directory, base string) (string, error) {
+	if base == "" {
+		base = "main"
+	}
+
+	pattern := `^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9./-]+\))?!?: .+`
+	script := fmt.Sprintf(`set -uo pipefail
+bad=0
+while read -r sha subject; do
+  case "$subject" in
+    "Merge "*|"fixup! "*|"squash! "*) continue ;;
+  esac
+  if ! printf '%%s' "$subject" | grep -qE '%s'; then
+    echo "$sha does not follow Conventional Commits: \"$subject\""
+    bad=1
+  fi
+done < <(git log --format='%%H %%s' %s..HEAD)
+[ "$bad" -eq 0 ] || exit 1
+echo "all commit subjects are Conventional Commits"`, pattern, base)
+
+	return dag.Container().
+		From("alpine:3.21").
+		WithExec([]string{"apk", "add", "--no-cache", "git", "bash"}).
+		WithMountedDirectory("/src", source).
+		WithWorkdir("/src").
+		WithExec([]string{"bash", "-c", script}).
+		Stdout(ctx)
 }
 
 // FmtCheck asserts the tree is rustfmt-clean.
