@@ -199,7 +199,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "dafs-alloc"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-api"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "dafs-alloc",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-daemon"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -239,14 +239,14 @@ dependencies = [
 
 [[package]]
 name = "dafs-memtest"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "dafs-scan"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "dafs-alloc",
  "dafs-store",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-store"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "rusqlite",
  "tempfile",

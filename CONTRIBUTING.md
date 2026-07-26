@@ -41,6 +41,13 @@ themselves — including as test fixtures.
 - CI must be green; don't skip gates
 - explain *why*, not just what — the what is in the diff
 
+## Commit messages
+
+[Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope): …`,
+`fix(scope): …`, `docs: …`, etc.). Version bumps and `CHANGELOG.md` are generated from
+these by release-please — an inaccurate type or scope shows up in the next release's
+changelog, not just in `git log`.
+
 ## Licence
 
 Contributions are under [MIT](LICENSE). By opening a PR you agree your work can
