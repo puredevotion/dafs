@@ -126,6 +126,24 @@ echo "all commit subjects are Conventional Commits"`, pattern, base)
 		Stdout(ctx)
 }
 
+// CargoVersions asserts every workspace member pins a literal
+// [package.version] matching [workspace.package].version.
+//
+// release-please's cargo-workspace plugin needs a literal semver to read and
+// bump per member; `version.workspace = true` parses as a table, not a
+// string, and broke every release-please run twice before
+// scripts/check-crate-versions.sh existed. Kept in lockstep with the
+// cargo-versions job in the GitHub workflow.
+func (m *DafsCi) CargoVersions(ctx context.Context, source *dagger.Directory) (string, error) {
+	return dag.Container().
+		From("alpine:3.21").
+		WithExec([]string{"apk", "add", "--no-cache", "gawk", "grep"}).
+		WithMountedDirectory("/src", source).
+		WithWorkdir("/src").
+		WithExec([]string{"sh", "scripts/check-crate-versions.sh"}).
+		Stdout(ctx)
+}
+
 // FmtCheck asserts the tree is rustfmt-clean.
 func (m *DafsCi) FmtCheck(ctx context.Context, source *dagger.Directory) (string, error) {
 	return m.rustBase(source, rustImage).
@@ -452,6 +470,7 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory) (string, e
 		name string
 		run  func() error
 	}{
+		{"cargo-versions", func() error { _, e := m.CargoVersions(ctx, source); return e }},
 		{"fmt", func() error { _, e := m.FmtCheck(ctx, source); return e }},
 		{"lint", func() error { _, e := m.Lint(ctx, source); return e }},
 		{"test", func() error { _, e := m.Test(ctx, source); return e }},
