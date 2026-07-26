@@ -26,10 +26,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod log_history;
 mod logging;
 pub mod timeline;
 pub mod watch_control;
 
+pub use log_history::LogHistory;
 pub use logging::LogLevelHandle;
 pub use timeline::{TimelineItem, TimelineReader, TimelineStats, TimelineStore};
 pub use watch_control::{WatchControl, WatchControlHandle, WatchMode};
@@ -65,6 +67,9 @@ struct StateInner {
     /// Set once the daemon wires in an observer that can be reconfigured
     /// live. `None` in unit tests of routes that do not touch it.
     watch_control: Option<WatchControlHandle>,
+    /// Set when the daemon installs a second tracing sink capturing recent
+    /// output. `None` in unit tests of routes that do not touch it.
+    log_history: Option<LogHistory>,
 }
 
 impl AppState {
@@ -77,6 +82,7 @@ impl AppState {
                 timeline: None,
                 log_level: None,
                 watch_control: None,
+                log_history: None,
             }),
         }
     }
@@ -97,6 +103,12 @@ impl AppState {
     /// Attach the watch-root control handle.
     pub fn with_watch_control(mut self, handle: WatchControlHandle) -> Self {
         Self::inner_mut(&mut self).watch_control = Some(handle);
+        self
+    }
+
+    /// Attach the log history ring buffer.
+    pub fn with_log_history(mut self, history: LogHistory) -> Self {
+        Self::inner_mut(&mut self).log_history = Some(history);
         self
     }
 
@@ -121,6 +133,10 @@ impl AppState {
 
     pub fn watch_control(&self) -> Option<&WatchControlHandle> {
         self.inner.watch_control.as_ref()
+    }
+
+    pub fn log_history(&self) -> Option<&LogHistory> {
+        self.inner.log_history.as_ref()
     }
 
     /// Mark the daemon ready to serve. Called once startup work finishes.
@@ -171,6 +187,9 @@ pub fn router(state: AppState) -> Router {
         // GET reads the current roots; PUT adds to or replaces them, live —
         // see `watch_control` for why the daemon exposes this at all.
         .route("/watch", get(get_watch).put(put_watch))
+        // Recent formatted log lines — see `log_history` for why a detached
+        // daemon needs this to be queryable rather than left in a file.
+        .route("/logs", get(get_logs))
         .fallback(not_found)
         // Bound every request body. The only route that takes one expects a few
         // dozen bytes, and without a limit an unauthenticated caller can make
@@ -383,6 +402,40 @@ async fn put_watch(
                 .into_response()
         }
     }
+}
+
+/// Query parameters for `/logs`.
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    limit: Option<u32>,
+}
+
+/// Default and maximum lines returned by `/logs`, mirroring `/events`'s
+/// `DEFAULT_EVENT_LIMIT`: a default small enough to be cheap to poll
+/// repeatedly, a maximum bounded by the ring's own capacity so a caller
+/// cannot ask for more history than the daemon actually retains.
+const DEFAULT_LOG_LIMIT: u32 = 200;
+const MAX_LOG_LIMIT: u32 = 2000;
+
+#[derive(Serialize)]
+struct LogsResponse {
+    lines: Vec<String>,
+}
+
+async fn get_logs(
+    State(state): State<AppState>,
+    Query(query): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let Some(history) = state.log_history() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "log history not attached" }),
+        )
+            .into_response();
+    };
+
+    let limit = query.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT) as usize;
+    (StatusCode::OK, Json(LogsResponse { lines: history.recent(limit) })).into_response()
 }
 
 async fn ui_index() -> impl IntoResponse {
@@ -824,5 +877,42 @@ mod tests {
 
     fn control_stub() -> watch_control::testing::FakeWatchControl {
         watch_control::testing::FakeWatchControl::new(vec![])
+    }
+
+    #[tokio::test]
+    async fn get_logs_without_history_is_503() {
+        let (status, _) = get(router(AppState::new(1)), "/logs").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn get_logs_reports_recent_lines() {
+        let history = LogHistory::new();
+        {
+            use std::io::Write as _;
+            history.writer().write_all(b"line one\nline two\n").unwrap();
+        }
+        let app = router(AppState::new(1).with_log_history(history));
+
+        let (status, body) = get(app, "/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("line one") && body.contains("line two"), "unexpected body: {body}");
+    }
+
+    #[tokio::test]
+    async fn get_logs_respects_a_limit() {
+        let history = LogHistory::new();
+        {
+            use std::io::Write as _;
+            for n in 0..5 {
+                history.writer().write_all(format!("line {n}\n").as_bytes()).unwrap();
+            }
+        }
+        let app = router(AppState::new(1).with_log_history(history));
+
+        let (status, body) = get(app, "/logs?limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("line 0"), "should have dropped older lines: {body}");
+        assert!(body.contains("line 4"), "should keep the most recent: {body}");
     }
 }
