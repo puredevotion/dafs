@@ -55,21 +55,49 @@ fn http_ok_json(body: &str) -> Vec<u8> {
     http_response("HTTP/1.1 200 OK", "application/json", body.as_bytes())
 }
 
-/// Accepts exactly one connection, writes `response` verbatim, then drops
-/// the socket. Returns the `base_url` a [`Config`] should point at.
+/// Reads whatever the client sends until a short idle window passes with no
+/// new bytes — a request over loopback can arrive in more than one TCP
+/// segment, and a single bounded `read()` is not guaranteed to have drained
+/// all of it just because the request itself is small.
 ///
-/// Draining the request before replying matters here: without it, a request
-/// body larger than the OS's socket receive buffer could leave `ureq`
-/// blocked on `write` while this thread is blocked on `write` too, since
-/// neither side is reading — a self-inflicted deadlock that has nothing to
-/// do with the property under test.
+/// Draining fully, not just once, is what the property under test actually
+/// needs: on Linux, closing a socket while bytes it sent are still sitting
+/// unread in the kernel's receive buffer sends an RST instead of a clean
+/// FIN. That RST can then arrive at the client mid-read of *this* server's
+/// response — which is exactly the flake this function exists to prevent,
+/// and why it shows up on the large-response test specifically: a bigger
+/// response means a longer read window for a leftover RST to land in, not
+/// anything about response size itself.
+fn drain_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    stream.set_read_timeout(Some(Duration::from_millis(200))).expect("set_read_timeout");
+    let mut buf = [0u8; 65536];
+    let mut received = Vec::new();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            // A timed-out read with nothing new means the client has
+            // finished sending (it's now waiting on us for a response), not
+            // that the connection failed.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    // Back to blocking with no deadline for the write that follows — a
+    // read timeout has no bearing on how long a reply is allowed to take.
+    stream.set_read_timeout(None).expect("clear read_timeout");
+    received
+}
+
+/// Accepts exactly one connection, drains its request, writes `response`
+/// verbatim, then drops the socket. Returns the `base_url` a [`Config`]
+/// should point at.
 fn mock_server(response: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 65536];
-            let _ = stream.read(&mut buf);
+            drain_request(&mut stream);
             let _ = stream.write_all(&response);
             let _ = stream.flush();
         }
@@ -87,10 +115,8 @@ fn mock_server_capturing_request(response: Vec<u8>) -> (String, Arc<Mutex<Vec<u8
     let port = listener.local_addr().expect("local_addr").port();
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            buf.truncate(n);
-            *captured_for_thread.lock().expect("lock") = buf;
+            let received = drain_request(&mut stream);
+            *captured_for_thread.lock().expect("lock") = received;
             let _ = stream.write_all(&response);
             let _ = stream.flush();
         }
