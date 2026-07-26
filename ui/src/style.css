@@ -137,6 +137,35 @@ h1 {
   outline-offset: 2px;
 }
 
+/* Facet filters (M02a). Same shape as .filters immediately above by design:
+   both are "narrow the timeline by one field", and a second visual language
+   for the same idea would just be more for the eye to reconcile. */
+
+.facets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.25rem;
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.facets select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.2rem 0.4rem;
+}
+
+.facets select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* Timeline */
 
 .timeline {
@@ -229,6 +258,38 @@ h1 {
   font-size: 0.85em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+/* A row expands only once it has extracted metadata to show (see makeExpandable
+   in main.js) — most rows against today's daemon have none, and stay exactly
+   as plain as they were before this feature. */
+.event.expandable {
+  cursor: pointer;
+}
+
+.event.expandable:hover {
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.details {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.15rem 0.75rem;
+  margin: 0.5rem 0 0.15rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.85em;
+}
+
+.details dt {
+  color: var(--muted);
+}
+
+.details dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: break-word;
 }
 
 /* Messages and paging */

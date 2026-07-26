@@ -60,6 +60,26 @@ kept only as provenance; the substance is reproduced here in full.
    restated as a per-milestone menu. See §5. #215's checklist is kept but is made
    surface-appropriate: DAST tools apply where there is an HTTP surface, and nowhere else.
 8. Each milestone = its own feature branch + PR. Never commit to main.
+9. **Standalone by default: every native/binary dependency is vendored, never a Nix
+   requirement.** Established at M02a when pdfium (native PDF parsing, isolated in its own
+   worker process — §3.4's FUSE reasoning applied to a hostile-input C++ library instead of
+   an LLM) was first wired up via a Nix `buildInputs` addition, then corrected: `cargo build`
+   alone, with no Nix and no network, must produce a fully working binary. The shared
+   library is vendored into the repo and embedded into the binary (`include_bytes!`,
+   extracted to a cache file on first run) — the same "commit the artifact, keep the Rust
+   build hermetic" trade already made for `ui/dist/index.html` and for SQLite via
+   rusqlite's `bundled` feature. Nix, where it's used at all, stays one optional packaging
+   path (reproducible builds, the OCI image) and is never required to produce a working
+   `dafs` binary. This applies to every future milestone that adds a native/binary
+   dependency, not just pdfium — checked per-milestone against §7 item 5's size question,
+   and against the unavoidable exceptions below:
+   - **Too large to vendor at build time**: M02b/M08's LLM weights (multi-GB) cannot be
+     `include_bytes!`'d the way pdfium's ~tens-of-MB library can — see §7 item 5.
+   - **Cannot be vendored at all**: FUSE (M06/M11a/M11b) needs kernel-level support
+     (a kernel module plus, on macOS, a separate macFUSE install) that no amount of
+     bundling reaches; Windows CFAPI (M12) is a host-OS-provided API, not a library to
+     ship. Both get documented as standalone-principle exceptions when their milestone
+     lands, not treated as a violation of this one.
 
 ---
 
@@ -403,6 +423,18 @@ The five open questions from the first draft of this document, now answered.
 4. **Windows memory story (M12).** §8's budget is measured on Linux. CFAPI placeholder
    hydration has its own working-set behaviour and no `madvise` equivalent. Needs its own
    ceiling, set at M12.
+5. **LLM model distribution (M02b/M08) — flagged, not decided.** §2 item 9's vendoring
+   principle explicitly cannot apply here the way it does to pdfium: a Gemma-class 4B
+   model's weights are gigabytes, not tens of megabytes, and `include_bytes!`-ing that into
+   a committed binary would make every clone, CI run, and release artifact carry a
+   multi-gigabyte payload whether or not the AI worker is ever used. The likely shape is a
+   runtime fetch-and-cache-once (hash-pinned URL, verified checksum, cached outside git,
+   never touching the repo) rather than a build-time embed — but that means the AI worker
+   genuinely needs a network connection *the first time* it runs, on whichever device asks
+   for enrichment, which is a real deployment-experience question for the NAS/homelab
+   target hardware (§0's "no GPU" audience) that §2 item 9 doesn't answer by itself. Needs
+   its own decision at M02b, with the actual model size and a first-run UX sketched out
+   before building it, not assumed.
 
 ---
 

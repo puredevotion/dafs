@@ -6,16 +6,53 @@
 // them.
 
 /**
+ * A row of the timeline as the daemon serves it.
+ *
+ * The M02a fields below are all optional and independently nullable:
+ * extraction runs per-file and per-extractor, so a PDF carries
+ * doc_type/title/page_count but never git_*, a source file under a repo
+ * carries git_* but never page_count, and a file that has not been extracted
+ * yet (or predates M02a entirely) carries none of them. Absence is the normal
+ * case, not a partial-failure signal — rendering code must treat a missing
+ * field exactly like an extractor that found nothing, never as an error.
+ *
+ * @typedef {Object} TimelineItem
+ * @property {number} id
+ * @property {string} kind
+ * @property {string} path
+ * @property {string} [previous_path]
+ * @property {number} at_unix_ms
+ * @property {number} [size_bytes]
+ * @property {string} [doc_type]
+ * @property {string} [title]
+ * @property {string} [author]
+ * @property {string} [language]
+ * @property {number} [page_count]
+ * @property {number} [word_count]
+ * @property {string} [git_branch]
+ * @property {string} [git_head_commit]
+ * @property {string} [git_head_author]
+ * @property {number} [git_head_at_unix] - Seconds, unlike `at_unix_ms` above:
+ *   this is the commit's own timestamp, not when the daemon observed the file.
+ */
+
+/**
  * Fetch a page of the timeline.
  *
- * @param {{ kind?: string, beforeId?: number, limit?: number }} options
- * @returns {Promise<{events: Array, next_before_id?: number}>}
+ * @param {{ kind?: string, beforeId?: number, limit?: number, facets?: Record<string, string> }} options
+ *   `facets` maps a facet field name (doc_type, author, language, git_branch)
+ *   to the single value to filter on; empty/absent values are omitted rather
+ *   than sent as empty query params, matching how `kind` already behaves.
+ * @returns {Promise<{events: TimelineItem[], next_before_id?: number}>}
  */
-export async function fetchEvents({ kind = "", beforeId, limit = 50 } = {}) {
+export async function fetchEvents({ kind = "", beforeId, limit = 50, facets = {} } = {}) {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
   if (kind) params.set("kind", kind);
   if (beforeId != null) params.set("before_id", String(beforeId));
+  for (const [field, value] of Object.entries(facets)) {
+    if (value) params.set(field, value);
+  }
 
   const response = await fetch(`/events?${params}`);
   if (!response.ok) {
@@ -24,6 +61,25 @@ export async function fetchEvents({ kind = "", beforeId, limit = 50 } = {}) {
     // person reading the message is usually the one running the daemon.
     throw new Error(`/events returned HTTP ${response.status}`);
   }
+  return response.json();
+}
+
+/**
+ * Distinct values for one extracted-metadata facet, with counts, for building
+ * filter controls.
+ *
+ * M02a-only endpoint: it does not exist before that lands, so a 404 here is
+ * the expected response from today's daemon, not a real error. Callers must
+ * treat any failure — 404 or otherwise — as "no facets available" and hide
+ * the corresponding filter rather than surfacing it as a page error.
+ *
+ * @param {string} field - One of doc_type, author, language, git_branch.
+ * @returns {Promise<Array<{value: string, count: number}>>}
+ */
+export async function fetchFacets(field) {
+  const params = new URLSearchParams({ field });
+  const response = await fetch(`/facets?${params}`);
+  if (!response.ok) throw new Error(`/facets returned HTTP ${response.status}`);
   return response.json();
 }
 

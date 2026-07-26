@@ -1,0 +1,27 @@
+[package]
+name = "dafs-pdf-worker"
+description = "DAFS PDF text extraction: a supervised child process wrapping pdfium-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# default-features off: "image_latest"/"thread_safe" pull in the `image` crate
+# and a thread-safety layer this process needs neither of — one request, one
+# thread, then exit (see src/main.rs's module docs). Pinned to a specific
+# Pdfium API version (rather than "pdfium_latest") because the binding set
+# must not reference symbols newer than the shared library this crate
+# vendors and embeds (see vendor/NOTICE.md and src/main.rs's
+# `PDFIUM_SO_BYTES`) — an older, compatible binding set against a newer
+# runtime library is safe; the reverse is not.
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7543"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+whatlang = "0.18.0"
+
+[dev-dependencies]
+tempfile.workspace = true

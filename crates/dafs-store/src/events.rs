@@ -44,6 +44,12 @@ impl EventKind {
 }
 
 /// One row of the timeline, with its path already resolved.
+///
+/// The extraction fields mirror `metadata::FileMetadata` exactly (same names,
+/// same optionality) rather than nesting a `Option<FileMetadata>` — most
+/// callers want to filter and display these alongside the event fields, and a
+/// nested struct would just make every access two levels deep for no benefit
+/// since both sides of the join key on the same `file_id`.
 #[derive(Debug, Clone)]
 pub struct TimelineEntry {
     pub id: i64,
@@ -55,6 +61,18 @@ pub struct TimelineEntry {
     pub is_dir: bool,
     /// Previous path, for renames.
     pub previous_path: Option<String>,
+    pub doc_type: Option<String>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub language: Option<String>,
+    pub page_count: Option<i64>,
+    pub word_count: Option<i64>,
+    pub image_taken_at_unix: Option<i64>,
+    pub image_camera_model: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_head_commit: Option<String>,
+    pub git_head_author: Option<String>,
+    pub git_head_at_unix: Option<i64>,
 }
 
 /// An event to append.
@@ -164,6 +182,15 @@ pub struct TimelineQuery {
     /// boundary.
     pub before_id: Option<i64>,
     pub kind: Option<EventKind>,
+    /// Facet filters, all exact-match against `file_metadata`. A file with no
+    /// metadata yet fails every one of these (the row is `NULL`, and `NULL =
+    /// value` is never true in SQL) — the same "absent means excluded" rule a
+    /// caller would expect from an equality filter on a column that happens
+    /// not to be populated yet.
+    pub doc_type: Option<String>,
+    pub author: Option<String>,
+    pub language: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 impl TimelineQuery {
@@ -173,46 +200,78 @@ impl TimelineQuery {
 }
 
 /// Read the timeline, most recent first.
+///
+/// The SQL is assembled from fixed string fragments chosen by which filters
+/// are `Some`, rather than hand-enumerated per combination: `before_id` and
+/// `kind` alone were 4 branches, and this query now has six independent
+/// optional filters — enumerating every combination would be 64 near-identical
+/// arms. Every fragment pushed into `conditions` is a `&'static str` literal
+/// from this function, never caller input, so which fragments appear is
+/// data-driven but the SQL text itself is not — the same safety argument
+/// `metadata::distinct_facets` already relies on for its column name.
 pub fn timeline(
     conn: &Connection,
     query: &TimelineQuery,
 ) -> Result<Vec<TimelineEntry>, StoreError> {
     let limit = query.effective_limit();
 
-    // Built by branching over fixed SQL strings rather than concatenating
-    // fragments: every value is still bound, and the set of possible statements
-    // is enumerable by reading this function.
-    let sql = match (query.before_id.is_some(), query.kind.is_some()) {
-        (false, false) => {
-            "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
-                    f.is_dir, e.prev_parent_id, e.prev_component_id
-               FROM events e JOIN files f ON f.id = e.file_id
-              ORDER BY e.at_unix_ms DESC, e.id DESC LIMIT ?1"
-        }
-        (true, false) => {
-            "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
-                    f.is_dir, e.prev_parent_id, e.prev_component_id
-               FROM events e JOIN files f ON f.id = e.file_id
-              WHERE e.id < ?2
-              ORDER BY e.at_unix_ms DESC, e.id DESC LIMIT ?1"
-        }
-        (false, true) => {
-            "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
-                    f.is_dir, e.prev_parent_id, e.prev_component_id
-               FROM events e JOIN files f ON f.id = e.file_id
-              WHERE e.kind = ?2
-              ORDER BY e.at_unix_ms DESC, e.id DESC LIMIT ?1"
-        }
-        (true, true) => {
-            "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
-                    f.is_dir, e.prev_parent_id, e.prev_component_id
-               FROM events e JOIN files f ON f.id = e.file_id
-              WHERE e.id < ?2 AND e.kind = ?3
-              ORDER BY e.at_unix_ms DESC, e.id DESC LIMIT ?1"
-        }
+    let mut conditions: Vec<&'static str> = Vec::new();
+    // Parameters are collected in the same left-to-right order the `?`
+    // placeholders appear in the SQL text below (WHERE fragments, then the
+    // trailing LIMIT) — rusqlite binds bare `?` positionally by that order,
+    // not by any meaning attached to the value.
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(before_id) = query.before_id {
+        conditions.push("e.id < ?");
+        params.push(Box::new(before_id));
+    }
+    if let Some(kind) = query.kind {
+        conditions.push("e.kind = ?");
+        params.push(Box::new(kind.as_str()));
+    }
+    if let Some(doc_type) = query.doc_type.clone() {
+        conditions.push("fm.doc_type = ?");
+        params.push(Box::new(doc_type));
+    }
+    if let Some(author) = query.author.clone() {
+        conditions.push("fm.author = ?");
+        params.push(Box::new(author));
+    }
+    if let Some(language) = query.language.clone() {
+        conditions.push("fm.language = ?");
+        params.push(Box::new(language));
+    }
+    if let Some(git_branch) = query.git_branch.clone() {
+        conditions.push("fm.git_branch = ?");
+        params.push(Box::new(git_branch));
+    }
+
+    params.push(Box::new(limit));
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
     };
 
-    let mut stmt = conn.prepare_cached(sql)?;
+    // LEFT, not INNER: most files have no `file_metadata` row yet, and those
+    // events must still appear (with the new fields absent) rather than
+    // vanish from a query that applies no facet filter at all.
+    let sql = format!(
+        "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
+                f.is_dir, e.prev_parent_id, e.prev_component_id,
+                fm.doc_type, fm.title, fm.author, fm.language, fm.page_count, fm.word_count,
+                fm.image_taken_at_unix, fm.image_camera_model, fm.git_branch,
+                fm.git_head_commit, fm.git_head_author, fm.git_head_at_unix
+           FROM events e
+           JOIN files f ON f.id = e.file_id
+           LEFT JOIN file_metadata fm ON fm.file_id = e.file_id
+           {where_clause}
+          ORDER BY e.at_unix_ms DESC, e.id DESC LIMIT ?"
+    );
+
+    let mut stmt = conn.prepare_cached(&sql)?;
 
     let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RawEvent> {
         Ok(RawEvent {
@@ -224,22 +283,24 @@ pub fn timeline(
             is_dir: r.get::<_, i64>(5)? != 0,
             prev_parent_id: r.get(6)?,
             prev_component_id: r.get(7)?,
+            doc_type: r.get(8)?,
+            title: r.get(9)?,
+            author: r.get(10)?,
+            language: r.get(11)?,
+            page_count: r.get(12)?,
+            word_count: r.get(13)?,
+            image_taken_at_unix: r.get(14)?,
+            image_camera_model: r.get(15)?,
+            git_branch: r.get(16)?,
+            git_head_commit: r.get(17)?,
+            git_head_author: r.get(18)?,
+            git_head_at_unix: r.get(19)?,
         })
     };
 
-    type Rows = Result<Vec<RawEvent>, rusqlite::Error>;
-    let raw: Vec<RawEvent> = match (query.before_id, query.kind) {
-        (None, None) => stmt.query_map(rusqlite::params![limit], map_row)?.collect::<Rows>(),
-        (Some(before), None) => {
-            stmt.query_map(rusqlite::params![limit, before], map_row)?.collect::<Rows>()
-        }
-        (None, Some(kind)) => {
-            stmt.query_map(rusqlite::params![limit, kind.as_str()], map_row)?.collect::<Rows>()
-        }
-        (Some(before), Some(kind)) => stmt
-            .query_map(rusqlite::params![limit, before, kind.as_str()], map_row)?
-            .collect::<Rows>(),
-    }?;
+    let raw: Vec<RawEvent> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), map_row)?
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Path resolution is a separate pass rather than a recursive CTE in the
     // query: the walk is short, the rows are already limited to one page, and
@@ -265,6 +326,18 @@ pub fn timeline(
             size_bytes: e.size_bytes,
             is_dir: e.is_dir,
             previous_path,
+            doc_type: e.doc_type,
+            title: e.title,
+            author: e.author,
+            language: e.language,
+            page_count: e.page_count,
+            word_count: e.word_count,
+            image_taken_at_unix: e.image_taken_at_unix,
+            image_camera_model: e.image_camera_model,
+            git_branch: e.git_branch,
+            git_head_commit: e.git_head_commit,
+            git_head_author: e.git_head_author,
+            git_head_at_unix: e.git_head_at_unix,
         });
     }
 
@@ -280,6 +353,18 @@ struct RawEvent {
     is_dir: bool,
     prev_parent_id: Option<FileId>,
     prev_component_id: Option<ComponentId>,
+    doc_type: Option<String>,
+    title: Option<String>,
+    author: Option<String>,
+    language: Option<String>,
+    page_count: Option<i64>,
+    word_count: Option<i64>,
+    image_taken_at_unix: Option<i64>,
+    image_camera_model: Option<String>,
+    git_branch: Option<String>,
+    git_head_commit: Option<String>,
+    git_head_author: Option<String>,
+    git_head_at_unix: Option<i64>,
 }
 
 /// Reconstruct where a renamed file used to be.
@@ -400,9 +485,11 @@ mod tests {
         let mut seen: Vec<i64> = Vec::new();
         let mut cursor: Option<i64> = None;
         loop {
-            let page =
-                timeline(&conn, &TimelineQuery { limit: Some(3), before_id: cursor, kind: None })
-                    .expect("timeline");
+            let page = timeline(
+                &conn,
+                &TimelineQuery { limit: Some(3), before_id: cursor, ..Default::default() },
+            )
+            .expect("timeline");
             if page.is_empty() {
                 break;
             }
@@ -431,6 +518,103 @@ mod tests {
         .expect("timeline");
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].kind, EventKind::Created);
+    }
+
+    #[test]
+    fn a_facet_filter_excludes_non_matching_rows() {
+        let (conn, pdf) = db_with_file("/a/report.pdf");
+        let mut i = Interner::new();
+        let docx = ensure_dir_chain(&conn, &mut i, Path::new("/a/report.docx")).expect("docx");
+
+        append(&conn, &NewEvent::now(pdf, EventKind::Created)).expect("append pdf");
+        append(&conn, &NewEvent::now(docx, EventKind::Created)).expect("append docx");
+
+        record_metadata(&conn, pdf, "pdf");
+        record_metadata(&conn, docx, "docx");
+
+        let entries =
+            timeline(&conn, &TimelineQuery { doc_type: Some("pdf".into()), ..Default::default() })
+                .expect("timeline");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, pdf);
+        assert_eq!(entries[0].doc_type.as_deref(), Some("pdf"));
+    }
+
+    /// A LEFT JOIN turns a missing `file_metadata` row into a NULL, and `NULL =
+    /// 'pdf'` is never true in SQL — so a facet filter must exclude a file that
+    /// has no metadata at all, not treat the absence as a match.
+    #[test]
+    fn a_facet_filter_excludes_rows_with_null_metadata() {
+        let (conn, file) = db_with_file("/a/unseen.pdf");
+        append(&conn, &NewEvent::now(file, EventKind::Created)).expect("append");
+
+        let entries =
+            timeline(&conn, &TimelineQuery { doc_type: Some("pdf".into()), ..Default::default() })
+                .expect("timeline");
+        assert!(entries.is_empty(), "a row with no metadata matched a facet filter: {entries:?}");
+    }
+
+    #[test]
+    fn combining_kind_and_a_facet_filter_narrows_both_ways() {
+        let (conn, pdf) = db_with_file("/a/report.pdf");
+        append(&conn, &NewEvent::now(pdf, EventKind::Created)).expect("append created");
+        append(&conn, &NewEvent::now(pdf, EventKind::Modified)).expect("append modified");
+        record_metadata(&conn, pdf, "pdf");
+
+        let mut i = Interner::new();
+        let docx = ensure_dir_chain(&conn, &mut i, Path::new("/a/report.docx")).expect("docx");
+        append(&conn, &NewEvent::now(docx, EventKind::Created)).expect("append docx");
+        record_metadata(&conn, docx, "docx");
+
+        let entries = timeline(
+            &conn,
+            &TimelineQuery {
+                kind: Some(EventKind::Created),
+                doc_type: Some("pdf".into()),
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, pdf);
+        assert_eq!(entries[0].kind, EventKind::Created);
+    }
+
+    #[test]
+    fn a_row_with_no_metadata_still_appears_with_new_fields_none() {
+        let (conn, file) = db_with_file("/a/plain.txt");
+        append(&conn, &NewEvent::now(file, EventKind::Created)).expect("append");
+
+        let entries = timeline(&conn, &TimelineQuery::default()).expect("timeline");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].doc_type, None);
+        assert_eq!(entries[0].title, None);
+        assert_eq!(entries[0].author, None);
+        assert_eq!(entries[0].language, None);
+        assert_eq!(entries[0].page_count, None);
+        assert_eq!(entries[0].word_count, None);
+        assert_eq!(entries[0].image_taken_at_unix, None);
+        assert_eq!(entries[0].image_camera_model, None);
+        assert_eq!(entries[0].git_branch, None);
+        assert_eq!(entries[0].git_head_commit, None);
+        assert_eq!(entries[0].git_head_author, None);
+        assert_eq!(entries[0].git_head_at_unix, None);
+    }
+
+    /// Minimal extraction record for a facet test — only `doc_type` varies,
+    /// everything else defaults.
+    fn record_metadata(conn: &Connection, file_id: FileId, doc_type: &str) {
+        crate::metadata::record_extraction(
+            conn,
+            file_id,
+            &crate::metadata::FileMetadata {
+                doc_type: Some(doc_type.into()),
+                extracted_at_unix: 1_000,
+                extractor_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record extraction");
     }
 
     #[test]

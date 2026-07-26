@@ -2,7 +2,9 @@
 //!
 //! M00 shipped the migration runner and the tuning against a deliberately
 //! minimal schema. M01 adds the real tables: interned path components, files,
-//! and the append-only event log the timeline reads from.
+//! and the append-only event log the timeline reads from. M02a adds
+//! `file_metadata` (deterministic extraction output) and `extraction_queue`
+//! (the durable work list that drives it) — see the `metadata` module.
 //!
 //! # Paths are interned, not stored
 //!
@@ -36,6 +38,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 pub mod events;
+pub mod metadata;
 pub mod paths;
 
 /// Store errors. Migration failures carry the version so a failed upgrade
@@ -166,6 +169,63 @@ const MIGRATIONS: &[Migration] = &[
         -- index is walked forwards rather than backwards.
         CREATE INDEX events_recent ON events(at_unix_ms DESC, id DESC);
         CREATE INDEX events_by_file ON events(file_id, at_unix_ms DESC);
+    ",
+    },
+    Migration {
+        version: 3,
+        name: "metadata",
+        sql: "
+        -- Deterministic extraction output (M02a): document type, author,
+        -- language, page/word counts, EXIF, git repo facts. No LLM output
+        -- lives here — that is M02b, and arrives as its own migration.
+        --
+        -- Flat and mostly NULL by design: one row per file regardless of
+        -- which extractor produced it, which keeps the timeline join to
+        -- exactly one table instead of one per document kind.
+        --
+        -- Unlike `events`, this is a *replaceable cache* over derived,
+        -- regenerable data (per the architecture's locked decision that AI
+        -- and extraction output must never be treated as a source of truth)
+        -- — re-extracting a file overwrites its row rather than appending a
+        -- new fact, which is why this table has no analogue of `events`'
+        -- append-only rule.
+        CREATE TABLE file_metadata (
+            file_id             INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            doc_type            TEXT,
+            title               TEXT,
+            author              TEXT,
+            language            TEXT,
+            page_count          INTEGER,
+            word_count          INTEGER,
+            image_taken_at_unix INTEGER,
+            image_camera_model  TEXT,
+            git_branch          TEXT,
+            git_head_commit     TEXT,
+            git_head_author     TEXT,
+            git_head_at_unix    INTEGER,
+            extracted_at_unix   INTEGER NOT NULL,
+            -- Bumped whenever extraction logic changes meaningfully, so an
+            -- upgrade can find and reprocess everything extracted by an
+            -- older version rather than leaving it stale forever.
+            extractor_version   INTEGER NOT NULL
+        ) STRICT;
+
+        -- The durable work queue: every Created/Modified event upserts a row
+        -- here, and a worker's success deletes it in the same transaction
+        -- that writes file_metadata. A crash between the two leaves the row
+        -- in place, which is what makes a kill -9 mid-extraction safe to
+        -- retry rather than silently losing the request.
+        --
+        -- attempt_count bounds a poison file (one that reliably crashes or
+        -- times out its extractor) to a handful of retries rather than
+        -- spinning a worker on it forever across restarts.
+        CREATE TABLE extraction_queue (
+            file_id        INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            queued_at_unix INTEGER NOT NULL,
+            attempt_count  INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+
+        CREATE INDEX extraction_queue_order ON extraction_queue(queued_at_unix ASC);
     ",
     },
 ];

@@ -7,12 +7,43 @@
 // taste.
 
 import "./style.css";
-import { fetchEvents, fetchMetrics, fetchVersion } from "./api.js";
+import { fetchEvents, fetchFacets, fetchMetrics, fetchVersion } from "./api.js";
 import { formatBytes, formatExact, formatWhen, groupByDay, splitPath } from "./format.js";
 
 /** How often the status strip and newest events refresh. */
 const POLL_MS = 5_000;
 const PAGE_SIZE = 50;
+
+/** Facet fields the daemon may expose, in the order the filter row shows them. */
+const FACET_FIELDS = [
+  { field: "doc_type", label: "Type" },
+  { field: "author", label: "Author" },
+  { field: "language", label: "Language" },
+  { field: "git_branch", label: "Branch" },
+];
+
+/**
+ * Extracted-metadata fields shown in a row's expansion, in display order.
+ *
+ * `format` converts the raw value to display text; its absence means
+ * `String(value)` is already right. Only fields present on a given entry are
+ * rendered, so a row with no M02a data (today's daemon, or a file no
+ * extractor matched) expands to nothing rather than a wall of blanks.
+ */
+const DETAIL_FIELDS = [
+  { key: "doc_type", label: "Type" },
+  { key: "title", label: "Title" },
+  { key: "author", label: "Author" },
+  { key: "language", label: "Language" },
+  { key: "page_count", label: "Pages" },
+  { key: "word_count", label: "Words", format: (v) => v.toLocaleString() },
+  { key: "git_branch", label: "Branch" },
+  { key: "git_head_commit", label: "Commit" },
+  { key: "git_head_author", label: "Commit author" },
+  // Seconds, not the milliseconds formatExact otherwise expects — this is the
+  // commit's own timestamp, not an observation time.
+  { key: "git_head_at_unix", label: "Commit time", format: (v) => formatExact(v * 1000) },
+];
 
 const el = {
   status: document.getElementById("status"),
@@ -23,10 +54,16 @@ const el = {
   message: document.getElementById("message"),
   more: document.getElementById("more"),
   filters: document.querySelector(".filters"),
+  // Populated by loadFacets, and only inserted into the page at all once at
+  // least one facet field comes back — against today's daemon /facets 404s
+  // for every field, so this stays null and the row never appears.
+  facets: null,
 };
 
 const state = {
   kind: "",
+  /** Selected value per facet field; empty string means "no filter". */
+  facets: {},
   /** Every entry currently displayed, newest first. */
   entries: [],
   /** Cursor for the next page, or null when the end has been reached. */
@@ -121,7 +158,57 @@ function eventRow(entry) {
   meta.append(when);
   li.append(meta);
 
+  // Only fields present on this entry, so a row with nothing extracted (every
+  // row, against today's pre-M02a daemon) gets no panel, no click handler, no
+  // extra attributes — it renders exactly as it did before this feature.
+  const present = DETAIL_FIELDS.filter(({ key }) => entry[key] != null);
+  if (present.length > 0) {
+    li.append(detailsPanel(entry, present));
+    makeExpandable(li);
+  }
+
   return li;
+}
+
+/** A hidden-by-default definition list of the extracted fields present on `entry`. */
+function detailsPanel(entry, fields) {
+  const dl = document.createElement("dl");
+  dl.className = "details";
+  dl.hidden = true;
+
+  for (const { key, label, format } of fields) {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    // textContent, same reasoning as the path above: extracted text (a
+    // document title, a git author) is still arbitrary user data.
+    dd.textContent = format ? format(entry[key]) : String(entry[key]);
+    dl.append(dt, dd);
+  }
+
+  return dl;
+}
+
+/** Wire a row that has a details panel appended to it to toggle that panel on click or Enter/Space. */
+function makeExpandable(li) {
+  const panel = li.querySelector(".details");
+  li.classList.add("expandable");
+  li.tabIndex = 0;
+  li.setAttribute("role", "button");
+  li.setAttribute("aria-expanded", "false");
+
+  const toggle = () => {
+    panel.hidden = !panel.hidden;
+    li.setAttribute("aria-expanded", String(!panel.hidden));
+  };
+
+  li.addEventListener("click", toggle);
+  li.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    // Space must not also scroll the page while the row is focused.
+    event.preventDefault();
+    toggle();
+  });
 }
 
 function showMessage(text, isError = false) {
@@ -138,7 +225,7 @@ function hideMessage() {
 async function loadFirstPage() {
   state.loading = true;
   try {
-    const page = await fetchEvents({ kind: state.kind, limit: PAGE_SIZE });
+    const page = await fetchEvents({ kind: state.kind, limit: PAGE_SIZE, facets: state.facets });
     state.entries = page.events;
     state.nextBeforeId = page.next_before_id ?? null;
     state.exhausted = page.events.length < PAGE_SIZE;
@@ -161,6 +248,7 @@ async function loadMore() {
       kind: state.kind,
       beforeId: state.nextBeforeId,
       limit: PAGE_SIZE,
+      facets: state.facets,
     });
 
     if (page.events.length === 0) {
@@ -192,7 +280,7 @@ async function pollNewest() {
   if (state.loading) return;
 
   try {
-    const page = await fetchEvents({ kind: state.kind, limit: PAGE_SIZE });
+    const page = await fetchEvents({ kind: state.kind, limit: PAGE_SIZE, facets: state.facets });
     if (page.events.length === 0) return;
 
     const known = new Set(state.entries.map((e) => e.id));
@@ -231,6 +319,68 @@ async function pollStatus() {
   }
 }
 
+/**
+ * Build the facet-filter row from whichever fields the daemon has data for.
+ *
+ * Each field is fetched independently and a failure — 404 against today's
+ * pre-M02a daemon, or any other error — just drops that one field, matching
+ * fetchFacets' contract. If every field fails, no container is ever inserted
+ * into the page: there is no empty filter row to explain away.
+ */
+async function loadFacets() {
+  const loaded = [];
+  for (const { field, label } of FACET_FIELDS) {
+    try {
+      const options = await fetchFacets(field);
+      if (Array.isArray(options) && options.length > 0) loaded.push({ field, label, options });
+    } catch {
+      // Expected against today's daemon (no /facets endpoint yet); nothing to
+      // report, the field's filter simply does not appear.
+    }
+  }
+  if (loaded.length === 0) return;
+
+  const container = document.createElement("nav");
+  container.className = "facets";
+  container.setAttribute("aria-label", "Filter by extracted metadata");
+
+  for (const { field, label, options } of loaded) {
+    state.facets[field] = "";
+
+    const wrapper = document.createElement("label");
+    wrapper.className = "facet";
+    wrapper.append(`${label} `);
+
+    const select = document.createElement("select");
+    select.dataset.facet = field;
+
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All";
+    select.append(all);
+
+    for (const { value, count } of options) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = `${value} (${count})`;
+      select.append(option);
+    }
+
+    wrapper.append(select);
+    container.append(wrapper);
+  }
+
+  container.addEventListener("change", (event) => {
+    const select = event.target.closest("select[data-facet]");
+    if (!select) return;
+    state.facets[select.dataset.facet] = select.value;
+    loadFirstPage();
+  });
+
+  el.filters.insertAdjacentElement("afterend", container);
+  el.facets = container;
+}
+
 el.filters.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-kind]");
   if (!button) return;
@@ -247,6 +397,7 @@ el.filters.addEventListener("click", (event) => {
 el.more.addEventListener("click", loadMore);
 
 loadFirstPage();
+loadFacets();
 pollStatus();
 setInterval(pollStatus, POLL_MS);
 setInterval(pollNewest, POLL_MS);

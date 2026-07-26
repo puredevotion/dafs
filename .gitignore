@@ -177,6 +177,10 @@ __pycache__/
 
 # C extensions
 *.so
+# ...except the vendored Pdfium runtime library: committed on purpose so
+# `dafs-pdf-worker` builds standalone with no network or Nix step — see
+# crates/dafs-pdf-worker/vendor/NOTICE.md.
+!crates/dafs-pdf-worker/vendor/*.so
 
 # Distribution / packaging
 .Python

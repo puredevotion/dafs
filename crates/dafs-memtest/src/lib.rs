@@ -14,6 +14,20 @@
 //! when the daemon does almost nothing, means every later milestone's PR shows
 //! its own memory cost — instead of the ceiling being discovered as unreachable
 //! at M03 with three milestones of design already committed to it.
+//!
+//! # `--detach false` is not optional here (found at M02a)
+//!
+//! `--detach` defaults on since M01a: the spawned process forks, redirects its
+//! own stdio, and the *parent* — the one whose pid `Command::spawn` hands
+//! back — exits immediately, leaving the daemon proper running as a different,
+//! unrelated pid this harness never learns. Every `Daemon::spawn*` constructor
+//! passes `--detach false` for exactly this reason. Without it,
+//! `resident_bytes()` still succeeds — it reads a real, if already-exited,
+//! process's `/proc/<pid>/statm` — so nothing here fails loudly; the ceiling
+//! assertion just silently measures near-zero and always "passes". This was
+//! caught by the M02a extraction-queue scenario reporting an implausible
+//! 0.00 MiB, not by the pre-existing idle-RSS test, which had been measuring
+//! nothing meaningful since `--detach` defaulted on and gave no sign of it.
 
 #![forbid(unsafe_code)]
 
@@ -42,12 +56,25 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Spawn the release daemon on an ephemeral port with a fresh data dir.
+    /// Spawn the release daemon on an ephemeral port with a fresh data dir,
+    /// watching nothing.
     ///
     /// Requires the binary to have been built already; the harness does not
     /// invoke cargo, so a stale binary would be measured silently. `binary()`
     /// checks the mtime against the source tree to catch that.
     pub fn spawn(binary: &Path) -> std::io::Result<Self> {
+        Self::spawn_inner(binary, None)
+    }
+
+    /// Spawn the release daemon watching `watch`, for scenarios that need it
+    /// to have something to scan and extract — `spawn`'s idle scenario is
+    /// deliberately watch-free, which is a different (and less realistic)
+    /// startup path than every real deployment takes.
+    pub fn spawn_watching(binary: &Path, watch: &Path) -> std::io::Result<Self> {
+        Self::spawn_inner(binary, Some(watch))
+    }
+
+    fn spawn_inner(binary: &Path, watch: Option<&Path>) -> std::io::Result<Self> {
         let data_dir = tempfile::tempdir()?;
         // Port 0 lets the OS choose, avoiding collisions when tests run in
         // parallel; the daemon logs the bound address, but reading it back from
@@ -56,16 +83,26 @@ impl Daemon {
         // else grabs the port in between — retried by the caller.
         let port = free_port()?;
 
-        let child = std::process::Command::new(binary)
-            .arg("--listen")
+        let mut cmd = std::process::Command::new(binary);
+        cmd.arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
             .arg("--data-dir")
             .arg(data_dir.path())
             .arg("--log")
             .arg("warn") // quieter logs mean less allocation noise in the measurement
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            // `--detach` defaults on (M01a): the spawned process forks, the
+            // parent exits immediately, and the daemon proper continues as a
+            // *different* pid this harness never learns. Left at its
+            // default, `resident_bytes()` reads the already-exited parent —
+            // near-zero RSS, read successfully, ceiling trivially "met". See
+            // this crate's docs on the bug this was.
+            .arg("--detach")
+            .arg("false");
+        if let Some(watch) = watch {
+            cmd.arg("--watch").arg(watch);
+        }
+        let child =
+            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn()?;
 
         Ok(Self { child, port, data_dir })
     }
@@ -182,6 +219,18 @@ pub fn status_is(response: &str, code: u16) -> bool {
         .is_some_and(|c| c == code)
 }
 
+/// Pull one Prometheus metric's numeric value out of a raw `/metrics`
+/// response.
+///
+/// A hand parser rather than a metrics-parsing crate: this is test-only code
+/// reading output produced by `dafs-api`'s own handler, a dependency this
+/// crate would otherwise have no reason to take on. Matches on the metric
+/// name starting a line, which the exposition format guarantees only the
+/// value line itself does — `# HELP`/`# TYPE` lines start with `#`.
+pub fn metric_value(response: &str, name: &str) -> Option<u64> {
+    response.lines().find_map(|line| line.strip_prefix(name)?.trim_start().parse().ok())
+}
+
 fn free_port() -> std::io::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -214,5 +263,24 @@ pub fn binary() -> Result<PathBuf, String> {
             "release binary not found at {}; run `cargo build --release -p dafs-daemon` first",
             candidate.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_value_reads_a_gauge_line_and_ignores_help_and_type_comments() {
+        let body = "# HELP dafs_extraction_queue_depth Files waiting.\n\
+                     # TYPE dafs_extraction_queue_depth gauge\n\
+                     dafs_extraction_queue_depth 7\n";
+        assert_eq!(metric_value(body, "dafs_extraction_queue_depth"), Some(7));
+    }
+
+    #[test]
+    fn metric_value_is_none_for_a_metric_absent_from_the_response() {
+        let body = "dafs_ready 1\n";
+        assert_eq!(metric_value(body, "dafs_extraction_queue_depth"), None);
     }
 }

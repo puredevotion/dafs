@@ -20,11 +20,18 @@ Debug builds allocate differently and are not a valid proxy.
 | Peak during initial 1M-file scan | **128 MiB** | M01 |
 | AI worker, resident while enriching | **4 GiB** | M02b |
 | AI worker, not enriching | **0** | M02b |
+| PDF extraction worker (pdfium), resident while active | not yet budgeted | M02a |
+| PDF extraction worker (pdfium), idle | **0** | M02a |
 
-The last row is the largest single win and it is a process-architecture decision,
-not an optimisation: the model does **not** live in the daemon. It runs as a
-separate process, spawned on demand, which exits when the enrichment queue
-drains. So the steady-state cost of having AI features is zero.
+The "not enriching"/idle rows are the largest single win and are a
+process-architecture decision, not an optimisation. Neither the AI model nor
+Pdfium lives in the daemon: each runs as a separate process, spawned on
+demand — the AI worker for as long as the enrichment queue has work, the PDF
+worker for exactly one file (see `crates/dafs-pdf-worker/src/main.rs`'s
+module docs for why one process per PDF rather than a persistent worker) —
+and exits when there is nothing left for it to do. So the steady-state cost
+of having either feature is zero, and a PDF that crashes its worker process
+(hostile bytes fed to a C++ parser) costs that one process, never the daemon.
 
 "Idle" means: after a full scan has completed and the process has been idle long
 enough for allocator decay to run. See *Settling* below — that qualifier is what

@@ -233,8 +233,15 @@ fn draw_events(frame: &mut Frame, area: Rect, status: &Status, caps: Capabilitie
                 ""
             };
             let suffix = if e.is_dir { "/" } else { "" };
+            // A daemon that predates M02a never sends `doc_type`, and this
+            // isn't a file event when it's absent for another reason (e.g. a
+            // directory) — either way, nothing to tag, so the line renders
+            // exactly as it did before this field existed rather than
+            // growing an empty `[]`.
+            let doc_type_tag =
+                e.doc_type.as_deref().map(|dt| format!("  [{dt}]")).unwrap_or_default();
             ListItem::new(format!(
-                "{ts}  #{:<6}{kind_glyph}{:<9}{}{}  {size}",
+                "{ts}  #{:<6}{kind_glyph}{:<9}{}{}  {size}{doc_type_tag}",
                 e.id, e.kind, e.path, suffix
             ))
         })
@@ -307,7 +314,57 @@ fn format_utc_time(unix_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
     use super::*;
+    use crate::client::TimelineItem;
+
+    fn item(id: i64, path: &str, doc_type: Option<&str>) -> TimelineItem {
+        TimelineItem {
+            id,
+            path: path.to_string(),
+            kind: "modified".to_string(),
+            at_unix_ms: 0,
+            size_bytes: None,
+            is_dir: false,
+            doc_type: doc_type.map(str::to_string),
+        }
+    }
+
+    /// Flattens a rendered frame into one string per row, so a test can
+    /// assert on visible text without caring about cell-by-cell styling.
+    fn rendered_rows(backend: &TestBackend, area: Rect) -> Vec<String> {
+        let buffer = backend.buffer();
+        (area.top()..area.bottom())
+            .map(|y| {
+                (area.left()..area.right()).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn events_with_a_doc_type_render_a_bracketed_tag() {
+        let status = Status {
+            events: vec![item(1, "/a/b.pdf", Some("pdf")), item(2, "/a/c.txt", None)],
+            ..Status::default()
+        };
+        let caps = Capabilities { truecolor: false, unicode: false };
+        let area = Rect::new(0, 0, 60, 5);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).expect("test terminal");
+        terminal.draw(|f| draw_events(f, area, &status, caps)).expect("draw doesn't panic");
+
+        let rows = rendered_rows(terminal.backend(), area);
+        let pdf_row = rows.iter().find(|r| r.contains("b.pdf")).expect("pdf event rendered");
+        assert!(pdf_row.contains("[pdf]"), "row was: {pdf_row:?}");
+
+        let txt_row = rows.iter().find(|r| r.contains("c.txt")).expect("txt event rendered");
+        assert!(
+            !txt_row.contains('['),
+            "an event with no doc_type must render with no bracket tag at all: {txt_row:?}"
+        );
+    }
 
     #[test]
     fn bytes_scale_to_the_right_unit() {

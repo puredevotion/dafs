@@ -59,7 +59,14 @@
             buildInputs = [ ];
 
             buildAndTestSubdir = null;
-            cargoBuildFlags = [ "-p" "dafs-daemon" ];
+            # dafs-pdf-worker is not a Cargo dependency of dafs-daemon — it is
+            # spawned as a sibling binary at runtime (crates/dafs-daemon/src/
+            # extract_worker.rs resolves it next to its own executable), so
+            # building only "-p dafs-daemon" would silently ship a daemon that
+            # can start but can never extract a PDF. Both binaries land in the
+            # same $out/bin, which is exactly the layout that resolution
+            # expects.
+            cargoBuildFlags = [ "-p" "dafs-daemon" "-p" "dafs-pdf-worker" ];
 
             # The memtest crate spawns the release binary, which the Nix build
             # sandbox has no network access to bind a socket for reliably, and
