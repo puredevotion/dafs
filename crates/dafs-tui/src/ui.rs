@@ -51,11 +51,65 @@ fn titled(caps: Capabilities, emoji: &str, text: &str) -> String {
     if caps.unicode { format!("{emoji} {text}") } else { text.to_string() }
 }
 
+/// Total height (including its own top/bottom border) of the logs panel.
+/// Fixed rather than proportional, so it's reliably at the bottom regardless
+/// of terminal size — that fixed size is also what [`LogScroll`]'s offset
+/// math assumes.
+pub const LOG_PANEL_HEIGHT: u16 = 12;
+
+/// Scroll position within the logs panel.
+///
+/// `None` means "follow the tail" — snap to the newest line every frame,
+/// the useful default for a live view. `Some(offset)` means the user has
+/// scrolled and the view holds still until they scroll back down to the
+/// bottom (which resumes following) or jump there explicitly.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LogScroll(Option<u16>);
+
+impl LogScroll {
+    const VISIBLE_LINES: u16 = LOG_PANEL_HEIGHT - 2;
+
+    fn max_offset(total_lines: usize) -> u16 {
+        (total_lines as u16).saturating_sub(Self::VISIBLE_LINES)
+    }
+
+    pub fn is_following(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn up(&mut self, total_lines: usize, by: u16) {
+        let current = self.0.unwrap_or_else(|| Self::max_offset(total_lines));
+        self.0 = Some(current.saturating_sub(by));
+    }
+
+    /// Scrolling down far enough to reach the bottom resumes following,
+    /// rather than leaving the view pinned one line above the tail forever.
+    pub fn down(&mut self, total_lines: usize, by: u16) {
+        let max = Self::max_offset(total_lines);
+        let current = self.0.unwrap_or(max);
+        let next = current.saturating_add(by);
+        self.0 = if next >= max { None } else { Some(next) };
+    }
+
+    pub fn to_top(&mut self) {
+        self.0 = Some(0);
+    }
+
+    pub fn to_bottom(&mut self) {
+        self.0 = None;
+    }
+
+    fn offset(&self, total_lines: usize) -> u16 {
+        self.0.unwrap_or_else(|| Self::max_offset(total_lines))
+    }
+}
+
 pub fn draw(
     frame: &mut Frame,
     url: &str,
     status: &Status,
     rss_history: &std::collections::VecDeque<u64>,
+    log_scroll: LogScroll,
     caps: Capabilities,
 ) {
     let area = frame.area();
@@ -65,6 +119,7 @@ pub fn draw(
         Constraint::Length(6),
         Constraint::Length(3),
         Constraint::Min(3),
+        Constraint::Length(LOG_PANEL_HEIGHT),
     ])
     .split(area);
 
@@ -73,6 +128,7 @@ pub fn draw(
     draw_stats(frame, chunks[2], status, caps);
     draw_sparkline(frame, chunks[3], rss_history, caps);
     draw_events(frame, chunks[4], status, caps);
+    draw_logs(frame, chunks[5], status, log_scroll, caps);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, url: &str, status: &Status, caps: Capabilities) {
@@ -87,7 +143,7 @@ fn draw_header(frame: &mut Frame, area: Rect, url: &str, status: &Status, caps: 
     let uptime = status.uptime_seconds.map(format_duration).unwrap_or_else(|| "-".into());
 
     let text = format!(
-        "{} {url}   {label}   version {version}   uptime {uptime}   (q to quit)",
+        "{} {url}   {label}   version {version}   uptime {uptime}   (q to quit, ↑/↓ to scroll logs)",
         glyph(caps, semantic)
     );
     let p = Paragraph::new(text)
@@ -193,6 +249,33 @@ fn draw_events(frame: &mut Frame, area: Rect, status: &Status, caps: Capabilitie
     frame.render_widget(list, area);
 }
 
+/// A dedicated, scrollable space for the daemon's own log output — added
+/// after real use showed daemon warnings/errors interleaved into the middle
+/// of this same screen (when the daemon shared a terminal with this tui
+/// without `--detach`). Kept at the very bottom, not wrapped: each stored
+/// line is one screen line, so scroll offsets are a plain line count, and a
+/// very long line is clipped horizontally rather than reflowed — the
+/// simpler, more predictable choice for a log view.
+fn draw_logs(
+    frame: &mut Frame,
+    area: Rect,
+    status: &Status,
+    scroll: LogScroll,
+    caps: Capabilities,
+) {
+    let total = status.log_lines.len();
+    let offset = scroll.offset(total);
+    let text = status.log_lines.join("\n");
+
+    let status_word = if scroll.is_following() { "tail" } else { "scrolled, ↓/G to resume tail" };
+    let title = titled(caps, "🪵", &format!("logs ({total}, {status_word})"));
+
+    let p = Paragraph::new(text)
+        .scroll((offset, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(p, area);
+}
+
 fn format_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
@@ -258,5 +341,59 @@ mod tests {
     fn unicode_titles_keep_the_emoji_prefix() {
         let caps = Capabilities { truecolor: false, unicode: true };
         assert_eq!(titled(caps, "📈", "rss trend"), "📈 rss trend");
+    }
+
+    #[test]
+    fn default_scroll_follows_the_tail() {
+        let scroll = LogScroll::default();
+        assert!(scroll.is_following());
+        // With more lines than fit, following means the offset is pinned to
+        // show the newest ones, not stuck at the top.
+        assert_eq!(scroll.offset(100), LogScroll::max_offset(100));
+        assert!(LogScroll::max_offset(100) > 0);
+    }
+
+    #[test]
+    fn few_lines_than_fit_offset_is_zero_even_while_following() {
+        let scroll = LogScroll::default();
+        assert_eq!(scroll.offset(3), 0, "nothing to scroll past when everything already fits");
+    }
+
+    #[test]
+    fn scrolling_up_stops_following() {
+        let mut scroll = LogScroll::default();
+        scroll.up(100, 1);
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.offset(100), LogScroll::max_offset(100) - 1);
+    }
+
+    #[test]
+    fn scrolling_down_to_the_bottom_resumes_following() {
+        let mut scroll = LogScroll::default();
+        scroll.up(100, 5); // pause, 5 lines above the tail
+        scroll.down(100, 5); // back to exactly the tail
+        assert!(
+            scroll.is_following(),
+            "reaching the bottom should resume the tail, not pin one line short of it"
+        );
+    }
+
+    #[test]
+    fn scrolling_down_short_of_the_bottom_stays_paused() {
+        let mut scroll = LogScroll::default();
+        scroll.up(100, 5);
+        scroll.down(100, 2);
+        assert!(!scroll.is_following());
+    }
+
+    #[test]
+    fn to_top_and_to_bottom_jump_directly() {
+        let mut scroll = LogScroll::default();
+        scroll.to_top();
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.offset(100), 0);
+
+        scroll.to_bottom();
+        assert!(scroll.is_following());
     }
 }

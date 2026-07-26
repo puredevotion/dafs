@@ -21,7 +21,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use dafs_tui::capabilities::Capabilities;
 use dafs_tui::client::{self, Client};
-use dafs_tui::ui;
+use dafs_tui::ui::{self, LogScroll};
 
 /// Samples of `dafs_resident_bytes` kept for the trend sparkline. At the
 /// default 1s refresh that's a 2-minute window — enough to see a scan spike
@@ -65,10 +65,11 @@ fn main() -> anyhow::Result<()> {
     let mut rss_history: VecDeque<u64> = VecDeque::with_capacity(RSS_HISTORY_LEN);
     push_rss_sample(&mut rss_history, &status);
     let mut last_poll = Instant::now();
+    let mut log_scroll = LogScroll::default();
 
     let result = loop {
-        if let Err(e) =
-            terminal.draw(|frame| ui::draw(frame, &args.url, &status, &rss_history, caps))
+        if let Err(e) = terminal
+            .draw(|frame| ui::draw(frame, &args.url, &status, &rss_history, log_scroll, caps))
         {
             break Err(e.into());
         }
@@ -83,6 +84,17 @@ fn main() -> anyhow::Result<()> {
                         && key.modifiers.contains(KeyModifiers::CONTROL));
                 if quit {
                     break Ok(());
+                }
+
+                let total = status.log_lines.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => log_scroll.up(total, 1),
+                    KeyCode::Down | KeyCode::Char('j') => log_scroll.down(total, 1),
+                    KeyCode::PageUp => log_scroll.up(total, 10),
+                    KeyCode::PageDown => log_scroll.down(total, 10),
+                    KeyCode::Home | KeyCode::Char('g') => log_scroll.to_top(),
+                    KeyCode::End | KeyCode::Char('G') => log_scroll.to_bottom(),
+                    _ => {}
                 }
             }
             Ok(_) => {}

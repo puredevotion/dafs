@@ -41,6 +41,16 @@ struct WatchResp {
     roots: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LogsResp {
+    lines: Vec<String>,
+}
+
+/// How many log lines to ask the daemon for each poll. Generous relative to
+/// what the scrollable panel shows at once — the point is to have enough
+/// history to actually scroll back through, not just the latest screenful.
+pub const LOG_FETCH_LIMIT: u32 = 500;
+
 /// A snapshot of everything the TUI shows, refreshed on every tick.
 ///
 /// Fetched as four independent requests rather than one combined call: there
@@ -67,6 +77,11 @@ pub struct Status {
     /// daemon and a new one watching different directories, indistinguishable
     /// from the outside without asking it directly).
     pub watch_roots: Vec<String>,
+    /// Recent formatted log lines, oldest first — the daemon's own ring
+    /// buffer is the source of truth; this is replaced wholesale each poll
+    /// rather than accumulated locally, so it's always what the daemon
+    /// actually has, not a client-side guess at what's new.
+    pub log_lines: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -135,6 +150,16 @@ impl Client {
             .map(|r| r.roots)
             .unwrap_or_default();
 
+        let log_lines = self
+            .agent
+            .get(&self.url("/logs"))
+            .query("limit", &LOG_FETCH_LIMIT.to_string())
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<LogsResp>().ok())
+            .map(|r| r.lines)
+            .unwrap_or_default();
+
         Status {
             connected: true,
             ready,
@@ -146,6 +171,7 @@ impl Client {
             files_known: metrics.get("dafs_files_known").map(|v| *v as u64),
             events,
             watch_roots,
+            log_lines,
             error: None,
         }
     }
