@@ -30,6 +30,9 @@
             # sources, package.json, or a stray node_modules would invalidate
             # the derivation on edits that cannot affect the built output.
             #
+            # `scripts` is included because dafs-daemon embeds
+            # scripts/install.sh the same way, for `dafs self-update`.
+            #
             # This is also why no node toolchain appears anywhere in this flake.
             # The bundle is committed (see .gitignore and the ui-bundle CI job),
             # so building the daemon needs nothing but Rust.
@@ -40,6 +43,7 @@
                 ./Cargo.lock
                 ./crates
                 ./ui/dist
+                ./scripts
               ];
             };
             cargoLock.lockFile = ./Cargo.lock;

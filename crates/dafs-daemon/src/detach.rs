@@ -5,6 +5,12 @@
 //! async runtime is not something to rely on: only the calling thread
 //! survives `fork()`, and tokio's other worker threads simply vanish in the
 //! child, so this has to happen while the process is still single-threaded.
+//!
+//! The fork/setsid/redirect dance itself lives in `dafs-detach`, not here:
+//! it needs an unsafe `fork()` call, which this crate's own
+//! `forbid(unsafe_code)` can't have. See that crate for why `daemonize` (the
+//! obvious off-the-shelf choice) isn't used instead — it's RUSTSEC-2025-0069,
+//! unmaintained with no safe upgrade, which cargo-deny in CI catches.
 
 use std::path::Path;
 
@@ -14,19 +20,9 @@ use anyhow::Context as _;
 /// `<data_dir>/dafs.log`.
 ///
 /// On success, the *parent* process exits inside this call and never
-/// returns — only the child (now the daemon) continues past it. That is the
-/// `daemonize` crate's own contract, not something this function adds.
+/// returns — only the child (now the daemon) continues past it.
 pub fn start(data_dir: &Path) -> anyhow::Result<()> {
     let log_path = data_dir.join("dafs.log");
-    let stdout = std::fs::File::create(&log_path)
-        .with_context(|| format!("creating log file {}", log_path.display()))?;
-    let stderr =
-        stdout.try_clone().context("cloning the log file handle for stderr redirection")?;
-
-    daemonize::Daemonize::new()
-        .working_directory(data_dir)
-        .stdout(stdout)
-        .stderr(stderr)
-        .start()
-        .map_err(|e| anyhow::anyhow!("daemonizing: {e}"))
+    dafs_detach::start(data_dir, &log_path)
+        .with_context(|| format!("daemonizing (log file {})", log_path.display()))
 }
