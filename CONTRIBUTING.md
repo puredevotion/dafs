@@ -41,6 +41,33 @@ themselves — including as test fixtures.
 - CI must be green; don't skip gates
 - explain *why*, not just what — the what is in the diff
 
+## Branches and merging
+
+`main` takes no direct pushes — every change lands through a pull request.
+Branch names follow what's already de facto true in this repo: `feat/*` for
+milestone and feature work, `fix/*` for bug fixes, `release/*` for the rare
+branch cut to stabilize a release. There is no permanent `develop` branch —
+`feat/*` → PR → `main` is trunk-based already, and a second long-lived branch
+would just be a second thing to keep in sync for no benefit at this size.
+
+`.github/rulesets/main-branch.json` is the source of truth for what's actually
+enforced (required status checks, no force-pushes, no branch deletion,
+required PR).
+
+## Commit signing
+
+Commits must be signed (SSH or GPG) — enforced by the branch ruleset above.
+SSH signing is the lower-friction option if you don't already have GPG set up:
+
+```sh
+git config gpg.format ssh
+git config user.signingkey ~/.ssh/id_ed25519.pub  # or your existing key
+git config commit.gpgsign true
+```
+
+GitHub needs the same public key added under **Settings → SSH and GPG keys →
+New SSH key**, key type "Signing Key".
+
 ## Licence
 
 Contributions are under [MIT](LICENSE). By opening a PR you agree your work can
