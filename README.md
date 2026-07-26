@@ -60,6 +60,7 @@ read-only)
 |---|---|---|
 | M00 | Walking skeleton + CI | *(nothing — scaffolding and the test gate)* ✅ |
 | M01 | Local timeline | "What did I work on today?" ✅ |
+| M01a | Ship it | Install without building from source, watch it running, update it in place |
 | M02a | Deterministic metadata + browse | Filter and skim by real document properties |
 | M02b | Local LLM enrichment | Summaries, keywords, entities |
 | M03 | Semantic search | Find things without remembering filenames |

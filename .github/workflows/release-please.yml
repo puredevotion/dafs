@@ -1,0 +1,26 @@
+# Automates the version bump / CHANGELOG / tag, nothing else.
+#
+# Deliberately does NOT create the GitHub Release itself
+# (release-please-config.json sets `skip-github-release: true`): release.yml already
+# owns that step — it builds artifacts, generates an SBOM, attests provenance, and
+# creates a draft release on the resulting tag push. Letting release-please also
+# create the release would race `gh release create` in release.yml against a release
+# that already exists for the same tag.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
