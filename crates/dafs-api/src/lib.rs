@@ -28,9 +28,13 @@ use serde::{Deserialize, Serialize};
 
 mod logging;
 pub mod timeline;
+pub mod watch_control;
 
 pub use logging::LogLevelHandle;
 pub use timeline::{TimelineItem, TimelineReader, TimelineStats, TimelineStore};
+pub use watch_control::{WatchControl, WatchControlHandle, WatchMode};
+
+use watch_control::{WatchChangeRequest, WatchRootsResponse};
 
 /// Shared daemon state handed to every route.
 ///
@@ -58,6 +62,9 @@ struct StateInner {
     timeline: Option<TimelineReader>,
     /// Set when the daemon installs a reloadable tracing filter.
     log_level: Option<LogLevelHandle>,
+    /// Set once the daemon wires in an observer that can be reconfigured
+    /// live. `None` in unit tests of routes that do not touch it.
+    watch_control: Option<WatchControlHandle>,
 }
 
 impl AppState {
@@ -69,6 +76,7 @@ impl AppState {
                 started_at: std::time::Instant::now(),
                 timeline: None,
                 log_level: None,
+                watch_control: None,
             }),
         }
     }
@@ -83,6 +91,12 @@ impl AppState {
     /// Attach the runtime log-level handle.
     pub fn with_log_level(mut self, handle: LogLevelHandle) -> Self {
         Self::inner_mut(&mut self).log_level = Some(handle);
+        self
+    }
+
+    /// Attach the watch-root control handle.
+    pub fn with_watch_control(mut self, handle: WatchControlHandle) -> Self {
+        Self::inner_mut(&mut self).watch_control = Some(handle);
         self
     }
 
@@ -103,6 +117,10 @@ impl AppState {
 
     pub fn log_level(&self) -> Option<&LogLevelHandle> {
         self.inner.log_level.as_ref()
+    }
+
+    pub fn watch_control(&self) -> Option<&WatchControlHandle> {
+        self.inner.watch_control.as_ref()
     }
 
     /// Mark the daemon ready to serve. Called once startup work finishes.
@@ -150,6 +168,9 @@ pub fn router(state: AppState) -> Router {
         // endpoint is acceptable on an unauthenticated API bound to loopback,
         // and what has to change if that bind ever widens.
         .route("/log-level", get(get_log_level).put(set_log_level))
+        // GET reads the current roots; PUT adds to or replaces them, live —
+        // see `watch_control` for why the daemon exposes this at all.
+        .route("/watch", get(get_watch).put(put_watch))
         .fallback(not_found)
         // Bound every request body. The only route that takes one expects a few
         // dozen bytes, and without a limit an unauthenticated caller can make
@@ -286,6 +307,61 @@ async fn set_log_level(
             tracing::warn!("rejected log filter {:?}: {e}", body.filter);
             (StatusCode::BAD_REQUEST, Json(ApiError { error: "invalid log filter" }))
                 .into_response()
+        }
+    }
+}
+
+async fn get_watch(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(control) = state.watch_control() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "watch control not attached" }),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, Json(WatchRootsResponse { roots: control.roots() })).into_response()
+}
+
+#[derive(Serialize)]
+struct WatchError {
+    error: String,
+}
+
+async fn put_watch(
+    State(state): State<AppState>,
+    Json(body): Json<WatchChangeRequest>,
+) -> impl IntoResponse {
+    let Some(control) = state.watch_control() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "watch control not attached" }),
+        )
+            .into_response();
+    };
+
+    // Validate before touching the observer: an empty root list is a client
+    // error for both modes — `add` with nothing to add is a no-op that would
+    // otherwise silently succeed, and `replace` with nothing would leave the
+    // daemon watching nothing with no way to tell that was intended.
+    if body.roots.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiError { error: "roots must not be empty" }))
+            .into_response();
+    }
+
+    let result = match body.mode {
+        WatchMode::Add => control.add_roots(body.roots),
+        WatchMode::Replace => control.replace_roots(body.roots),
+    };
+
+    match result {
+        Ok(()) => {
+            (StatusCode::OK, Json(WatchRootsResponse { roots: control.roots() })).into_response()
+        }
+        // The caller's error (a bad path), not the server's — a 500 here
+        // would tell a reconfiguring client to retry, which would not help.
+        Err(e) => {
+            tracing::warn!("rejected watch-root change: {e}");
+            (StatusCode::BAD_REQUEST, Json(WatchError { error: e })).into_response()
         }
     }
 }
@@ -547,6 +623,22 @@ mod tests {
         (status, body_string(resp).await)
     }
 
+    async fn put_json(app: Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        let status = resp.status();
+        (status, body_string(resp).await)
+    }
+
     #[tokio::test]
     async fn events_returns_the_timeline() {
         let (status, body) = get(router(state_with_events(3)), "/events").await;
@@ -651,5 +743,67 @@ mod tests {
             .expect("request");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(body_string(resp).await.contains("not found"));
+    }
+
+    fn state_with_watch_control(roots: Vec<&str>) -> AppState {
+        let control = watch_control::testing::FakeWatchControl::new(
+            roots.into_iter().map(String::from).collect(),
+        );
+        AppState::new(1).with_watch_control(Arc::new(control))
+    }
+
+    #[tokio::test]
+    async fn get_watch_without_control_is_503() {
+        let (status, _) = get(router(AppState::new(1)), "/watch").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn get_watch_reports_current_roots() {
+        let (status, body) =
+            get(router(state_with_watch_control(vec!["/a", "/b"])), "/watch").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("/a") && body.contains("/b"), "unexpected body: {body}");
+    }
+
+    #[tokio::test]
+    async fn put_watch_add_extends_the_root_list() {
+        let app = router(state_with_watch_control(vec!["/a"]));
+        let (status, body) = put_json(app, "/watch", r#"{"mode":"add","roots":["/b"]}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("/a") && body.contains("/b"), "add should keep /a: {body}");
+    }
+
+    #[tokio::test]
+    async fn put_watch_replace_drops_the_old_roots() {
+        let app = router(state_with_watch_control(vec!["/a"]));
+        let (status, body) = put_json(app, "/watch", r#"{"mode":"replace","roots":["/b"]}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("/a"), "replace should drop /a: {body}");
+        assert!(body.contains("/b"));
+    }
+
+    #[tokio::test]
+    async fn put_watch_rejects_an_empty_root_list() {
+        let app = router(state_with_watch_control(vec!["/a"]));
+        let (status, _) = put_json(app, "/watch", r#"{"mode":"add","roots":[]}"#).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty root list is ambiguous — silently a no-op or silently watching nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_watch_surfaces_the_control_s_own_error() {
+        let control = watch_control::testing::FakeWatchControl { fail: true, ..control_stub() };
+        let app = router(AppState::new(1).with_watch_control(Arc::new(control)));
+        let (status, body) = put_json(app, "/watch", r#"{"mode":"add","roots":["/b"]}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("broken"), "expected the control's own error, got: {body}");
+    }
+
+    fn control_stub() -> watch_control::testing::FakeWatchControl {
+        watch_control::testing::FakeWatchControl::new(vec![])
     }
 }
