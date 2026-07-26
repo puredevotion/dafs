@@ -37,6 +37,7 @@ pub(crate) fn extract_docx(bytes: &[u8]) -> Result<Extraction, Box<dyn Error>> {
         // actual layout engine can compute it. Leaving it unset is more
         // honest than a word-count-divided-by-a-guessed-constant number.
         page_count: None,
+        body_text: Some(crate::cap_body_text(&text)),
         ..Extraction::default()
     })
 }
@@ -70,6 +71,7 @@ pub(crate) fn extract_xlsx(bytes: &[u8]) -> Result<Extraction, Box<dyn Error>> {
         // isn't always present). Sheet count is the closest structural
         // analogue and is what this field means for spreadsheets here.
         page_count: Some(sheet_names.len() as i64),
+        body_text: Some(crate::cap_body_text(&text)),
         ..Extraction::default()
     })
 }
@@ -99,6 +101,7 @@ pub(crate) fn extract_pptx(bytes: &[u8]) -> Result<Extraction, Box<dyn Error>> {
         // Unlike docx, a slide *is* the presentation's unit of pagination —
         // one slideN.xml part per slide, no layout engine required.
         page_count: Some(slide_names.len() as i64),
+        body_text: Some(crate::cap_body_text(&text)),
         ..Extraction::default()
     })
 }

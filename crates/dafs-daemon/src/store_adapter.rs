@@ -14,6 +14,7 @@
 use std::sync::Mutex;
 
 use dafs_api::{TimelineItem, TimelineStats, TimelineStore};
+use dafs_store::enrichment::{self, FacetColumn as EnrichmentFacetColumn};
 use dafs_store::events::{EventKind, TimelineQuery};
 use dafs_store::metadata::{self, FacetColumn};
 use rusqlite::Connection;
@@ -56,6 +57,7 @@ impl TimelineStore for SqliteTimeline {
         author: Option<&str>,
         language: Option<&str>,
         git_branch: Option<&str>,
+        classification: Option<&str>,
     ) -> Result<Vec<TimelineItem>, String> {
         // An unparseable kind reaching here would mean the handler's validation
         // was bypassed; treat it as no filter rather than inventing one, since
@@ -71,6 +73,7 @@ impl TimelineStore for SqliteTimeline {
             author: author.map(String::from),
             language: language.map(String::from),
             git_branch: git_branch.map(String::from),
+            classification: classification.map(String::from),
         };
 
         self.with_conn(|conn| {
@@ -90,10 +93,26 @@ impl TimelineStore for SqliteTimeline {
     }
 
     fn facets(&self, field: &str) -> Result<Vec<(String, i64)>, String> {
-        // The handler validates `field` against these same four names before
+        // The handler validates `field` against these same five names before
         // calling here (see `dafs_api::lib`'s `/facets` route); an unrecognised
         // name reaching this far is a bypassed check, not a query this store
         // can answer, so it fails loudly rather than guessing a column.
+        //
+        // `classification` lives in `file_enrichment`, a different table from
+        // the other four, so it goes through a separate enum and query
+        // function (`enrichment::FacetColumn`/`distinct_facets`) rather than
+        // `metadata::FacetColumn` gaining a variant it has no column for.
+        if field == "classification" {
+            return self.with_conn(|conn| {
+                enrichment::distinct_facets(
+                    conn,
+                    EnrichmentFacetColumn::Classification,
+                    MAX_FACET_VALUES,
+                )
+                .map_err(|e| e.to_string())
+            });
+        }
+
         let column = match field {
             "doc_type" => FacetColumn::DocType,
             "author" => FacetColumn::Author,
@@ -135,6 +154,10 @@ fn to_dto(entry: dafs_store::events::TimelineEntry) -> TimelineItem {
         git_head_commit: entry.git_head_commit,
         git_head_author: entry.git_head_author,
         git_head_at_unix: entry.git_head_at_unix,
+        summary: entry.summary,
+        keywords: entry.keywords,
+        entities: entry.entities,
+        classification: entry.classification,
     }
 }
 
@@ -162,7 +185,7 @@ mod tests {
     #[test]
     fn timeline_maps_store_rows_to_dtos() {
         let store = store_with_events();
-        let items = store.timeline(10, None, None, None, None, None, None).expect("timeline");
+        let items = store.timeline(10, None, None, None, None, None, None, None).expect("timeline");
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].kind, "modified", "most recent first");
@@ -172,8 +195,9 @@ mod tests {
     #[test]
     fn filtering_by_kind_reaches_the_store() {
         let store = store_with_events();
-        let items =
-            store.timeline(10, None, Some("created"), None, None, None, None).expect("timeline");
+        let items = store
+            .timeline(10, None, Some("created"), None, None, None, None, None)
+            .expect("timeline");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "created");
@@ -183,8 +207,9 @@ mod tests {
     #[test]
     fn an_unparseable_kind_is_treated_as_no_filter() {
         let store = store_with_events();
-        let items =
-            store.timeline(10, None, Some("exploded"), None, None, None, None).expect("timeline");
+        let items = store
+            .timeline(10, None, Some("exploded"), None, None, None, None, None)
+            .expect("timeline");
         assert_eq!(items.len(), 2, "an unknown kind silently emptied the timeline");
     }
 
@@ -210,12 +235,46 @@ mod tests {
         .expect("record extraction");
 
         let items =
-            store.timeline(10, None, None, Some("text"), None, None, None).expect("timeline");
+            store.timeline(10, None, None, Some("text"), None, None, None, None).expect("timeline");
         assert_eq!(items.len(), 2, "both events are for the same extracted file");
         assert!(items.iter().all(|i| i.doc_type.as_deref() == Some("text")));
 
-        let none = store.timeline(10, None, None, Some("pdf"), None, None, None).expect("timeline");
+        let none =
+            store.timeline(10, None, None, Some("pdf"), None, None, None, None).expect("timeline");
         assert!(none.is_empty(), "a non-matching doc_type should exclude every row");
+    }
+
+    #[test]
+    fn filtering_by_classification_reaches_the_store() {
+        let store = store_with_events();
+        let file = dafs_store::paths::ensure_dir_chain(
+            &store.conn.lock().expect("lock"),
+            &mut Interner::new(),
+            Path::new("/home/u/a.txt"),
+        )
+        .expect("same file id");
+        enrichment::record_enrichment(
+            &store.conn.lock().expect("lock"),
+            file,
+            &enrichment::FileEnrichment {
+                classification: Some("business".into()),
+                enriched_at_unix: 1_000,
+                enrichment_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record enrichment");
+
+        let items = store
+            .timeline(10, None, None, None, None, None, None, Some("business"))
+            .expect("timeline");
+        assert_eq!(items.len(), 2, "both events are for the same enriched file");
+        assert!(items.iter().all(|i| i.classification.as_deref() == Some("business")));
+
+        let none = store
+            .timeline(10, None, None, None, None, None, None, Some("personal"))
+            .expect("timeline");
+        assert!(none.is_empty(), "a non-matching classification should exclude every row");
     }
 
     #[test]
@@ -241,6 +300,31 @@ mod tests {
 
         let values = store.facets("doc_type").expect("facets");
         assert_eq!(values, vec![("text".to_string(), 1)]);
+    }
+
+    #[test]
+    fn facets_returns_distinct_values_from_file_enrichment() {
+        let store = store_with_events();
+        let file = dafs_store::paths::ensure_dir_chain(
+            &store.conn.lock().expect("lock"),
+            &mut Interner::new(),
+            Path::new("/home/u/a.txt"),
+        )
+        .expect("same file id");
+        enrichment::record_enrichment(
+            &store.conn.lock().expect("lock"),
+            file,
+            &enrichment::FileEnrichment {
+                classification: Some("business".into()),
+                enriched_at_unix: 1_000,
+                enrichment_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record enrichment");
+
+        let values = store.facets("classification").expect("facets");
+        assert_eq!(values, vec![("business".to_string(), 1)]);
     }
 
     #[test]
@@ -286,7 +370,7 @@ mod tests {
 
         // The next query must still work.
         let items = store
-            .timeline(10, None, None, None, None, None, None)
+            .timeline(10, None, None, None, None, None, None, None)
             .expect("timeline after poisoning");
         assert_eq!(items.len(), 2);
     }

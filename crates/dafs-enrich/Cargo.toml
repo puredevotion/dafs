@@ -1,0 +1,22 @@
+[package]
+name = "dafs-enrich"
+description = "DAFS LLM enrichment: a thin client for a user-configured OpenAI-compatible endpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# "tls" on top of dafs-tui's json-only config: a hosted endpoint needs HTTPS,
+# where dafs-tui only ever talks to the daemon's own loopback HTTP.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+[dev-dependencies]
+tempfile = "3"

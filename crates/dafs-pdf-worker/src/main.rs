@@ -76,6 +76,13 @@ struct Response {
     page_count: Option<i64>,
     word_count: Option<i64>,
     language: Option<String>,
+    /// M02b's enrichment worker reads this back to build an LLM prompt
+    /// without re-extracting the PDF a second time — same role as
+    /// `dafs_extract::Extraction::body_text`. Capped the same way (see
+    /// `cap_body_text`) rather than depending on `dafs-extract` for one
+    /// constant: this crate's whole point is staying its own isolated
+    /// process, not accumulating cross-crate coupling for a few lines.
+    body_text: Option<String>,
     /// `Some` means every other field above is meaningless — the caller
     /// checks this first, not "are the other fields all `None`", since a
     /// PDF with genuinely no title/author is a successful extraction too.
@@ -90,8 +97,21 @@ impl Response {
             page_count: None,
             word_count: None,
             language: None,
+            body_text: None,
             error: Some(message.into()),
         }
+    }
+}
+
+/// Mirrors `dafs_extract::MAX_BODY_TEXT_CHARS`/`cap_body_text` exactly — kept
+/// as a local duplicate rather than a dependency on that crate, per this
+/// struct's own doc comment.
+const MAX_BODY_TEXT_CHARS: usize = 8_000;
+
+fn cap_body_text(text: &str) -> String {
+    match text.char_indices().nth(MAX_BODY_TEXT_CHARS) {
+        Some((byte_idx, _)) => text[..byte_idx].to_string(),
+        None => text.to_string(),
     }
 }
 
@@ -163,6 +183,7 @@ fn extract(request: &Request) -> Result<Response, String> {
         page_count: Some(document.pages().len() as i64),
         word_count: Some(word_count(&text)),
         language: detect_language(&text),
+        body_text: Some(cap_body_text(&text)),
         error: None,
     })
 }

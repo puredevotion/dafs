@@ -22,6 +22,7 @@ path = "src/main.rs"
 dafs-alloc = { path = "../dafs-alloc" }
 dafs-api = { path = "../dafs-api" }
 dafs-detach = { path = "../dafs-detach" }
+dafs-enrich = { path = "../dafs-enrich" }
 dafs-extract = { path = "../dafs-extract" }
 dafs-scan = { path = "../dafs-scan" }
 dafs-store = { path = "../dafs-store" }

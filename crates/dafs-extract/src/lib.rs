@@ -65,6 +65,14 @@ pub struct Extraction {
     pub git_head_commit: Option<String>,
     pub git_head_author: Option<String>,
     pub git_head_at_unix: Option<i64>,
+    /// The concatenated body text a text-bearing extractor already builds
+    /// internally to compute `word_count`/`language` — exposed here (M02b)
+    /// so an LLM enrichment pass can read it back rather than re-parsing the
+    /// file a second time. `None` for anything with no text to expose
+    /// (images, git-only facts) — never populated just because it's cheap
+    /// to; the OOXML extractors already have this string, this field is
+    /// exposing what they compute, not new extraction work.
+    pub body_text: Option<String>,
 }
 
 /// Extraction failed. Always non-fatal to the caller — a failed extraction
@@ -96,6 +104,25 @@ pub enum ExtractError {
 /// without opening the file" is for), small enough to keep a handful of
 /// concurrent extractions well under the daemon's memory budget.
 pub const MAX_EXTRACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The character cap on [`Extraction::body_text`]. Independent of
+/// [`MAX_EXTRACT_BYTES`]: that bounds what's read off disk, this bounds what
+/// gets stored and later sent to an LLM — a few thousand characters is far
+/// more than a summarization prompt needs, and storing the full text of
+/// every large document would grow `file_metadata` roughly in proportion to
+/// corpus size, which is exactly what M01's path-interning work exists to
+/// avoid elsewhere in this store.
+pub const MAX_BODY_TEXT_CHARS: usize = 8_000;
+
+/// Truncate to [`MAX_BODY_TEXT_CHARS`] at a `char` boundary — byte-slicing
+/// arbitrary extracted text can land inside a multi-byte UTF-8 sequence and
+/// panic, which a `char_indices` walk cannot.
+pub fn cap_body_text(text: &str) -> String {
+    match text.char_indices().nth(MAX_BODY_TEXT_CHARS) {
+        Some((byte_idx, _)) => text[..byte_idx].to_string(),
+        None => text.to_string(),
+    }
+}
 
 /// Sniff and extract in one call: the entry point `dafs-daemon`'s extraction
 /// worker calls per queued file.

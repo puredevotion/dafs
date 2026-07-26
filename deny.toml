@@ -37,6 +37,15 @@ allow = [
   # object cache — there is no gix feature flag that avoids gix-pack, since
   # reading packed objects is not optional for a real repository.
   "MPL-2.0",
+  # A data licence, not a code licence — CDLA-Permissive-2.0's 2.0 revision
+  # dropped even the attribution requirement 1.0 had, so it imposes nothing
+  # a filesystem daemon needs to act on: no share-alike, no notice file, no
+  # patent restriction. Added deliberately for `webpki-roots` (Mozilla's
+  # root certificate bundle), pulled in by `ureq`'s `tls` feature —
+  # `dafs-enrich`'s client needs TLS to reach a hosted (as opposed to local)
+  # OpenAI-compatible endpoint, and `dafs-tui` already depends on `ureq`
+  # without it, so this is new only because M02b turned TLS on.
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 # `license-not-encountered` warnings for entries in this list are expected and

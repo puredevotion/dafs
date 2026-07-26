@@ -73,6 +73,15 @@ pub struct TimelineEntry {
     pub git_head_commit: Option<String>,
     pub git_head_author: Option<String>,
     pub git_head_at_unix: Option<i64>,
+    pub summary: Option<String>,
+    /// JSON array, stored as text — see `enrichment::FileEnrichment`. This
+    /// layer passes it through unparsed, same as `metadata`'s facet fields
+    /// pass through their own columns; parsing is the API DTO's job, if any
+    /// caller needs it.
+    pub keywords: Option<String>,
+    /// JSON array, stored as text.
+    pub entities: Option<String>,
+    pub classification: Option<String>,
 }
 
 /// An event to append.
@@ -191,6 +200,10 @@ pub struct TimelineQuery {
     pub author: Option<String>,
     pub language: Option<String>,
     pub git_branch: Option<String>,
+    /// Exact-match against `file_enrichment.classification`, same
+    /// "absent means excluded" rule as the four `file_metadata` facets above
+    /// — a file with no enrichment yet has a `NULL` here too.
+    pub classification: Option<String>,
 }
 
 impl TimelineQuery {
@@ -246,6 +259,10 @@ pub fn timeline(
         conditions.push("fm.git_branch = ?");
         params.push(Box::new(git_branch));
     }
+    if let Some(classification) = query.classification.clone() {
+        conditions.push("fe.classification = ?");
+        params.push(Box::new(classification));
+    }
 
     params.push(Box::new(limit));
 
@@ -257,16 +274,20 @@ pub fn timeline(
 
     // LEFT, not INNER: most files have no `file_metadata` row yet, and those
     // events must still appear (with the new fields absent) rather than
-    // vanish from a query that applies no facet filter at all.
+    // vanish from a query that applies no facet filter at all. The same
+    // reasoning gives `file_enrichment` a second LEFT JOIN — enrichment is
+    // optional and typically arrives even later than extraction.
     let sql = format!(
         "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
                 f.is_dir, e.prev_parent_id, e.prev_component_id,
                 fm.doc_type, fm.title, fm.author, fm.language, fm.page_count, fm.word_count,
                 fm.image_taken_at_unix, fm.image_camera_model, fm.git_branch,
-                fm.git_head_commit, fm.git_head_author, fm.git_head_at_unix
+                fm.git_head_commit, fm.git_head_author, fm.git_head_at_unix,
+                fe.summary, fe.keywords, fe.entities, fe.classification
            FROM events e
            JOIN files f ON f.id = e.file_id
            LEFT JOIN file_metadata fm ON fm.file_id = e.file_id
+           LEFT JOIN file_enrichment fe ON fe.file_id = e.file_id
            {where_clause}
           ORDER BY e.at_unix_ms DESC, e.id DESC LIMIT ?"
     );
@@ -295,6 +316,10 @@ pub fn timeline(
             git_head_commit: r.get(17)?,
             git_head_author: r.get(18)?,
             git_head_at_unix: r.get(19)?,
+            summary: r.get(20)?,
+            keywords: r.get(21)?,
+            entities: r.get(22)?,
+            classification: r.get(23)?,
         })
     };
 
@@ -338,6 +363,10 @@ pub fn timeline(
             git_head_commit: e.git_head_commit,
             git_head_author: e.git_head_author,
             git_head_at_unix: e.git_head_at_unix,
+            summary: e.summary,
+            keywords: e.keywords,
+            entities: e.entities,
+            classification: e.classification,
         });
     }
 
@@ -365,6 +394,10 @@ struct RawEvent {
     git_head_commit: Option<String>,
     git_head_author: Option<String>,
     git_head_at_unix: Option<i64>,
+    summary: Option<String>,
+    keywords: Option<String>,
+    entities: Option<String>,
+    classification: Option<String>,
 }
 
 /// Reconstruct where a renamed file used to be.
@@ -599,6 +632,10 @@ mod tests {
         assert_eq!(entries[0].git_head_commit, None);
         assert_eq!(entries[0].git_head_author, None);
         assert_eq!(entries[0].git_head_at_unix, None);
+        assert_eq!(entries[0].summary, None);
+        assert_eq!(entries[0].keywords, None);
+        assert_eq!(entries[0].entities, None);
+        assert_eq!(entries[0].classification, None);
     }
 
     /// Minimal extraction record for a facet test — only `doc_type` varies,
@@ -615,6 +652,91 @@ mod tests {
             },
         )
         .expect("record extraction");
+    }
+
+    /// Minimal enrichment record for a facet test — only `classification`
+    /// varies, everything else defaults.
+    fn record_enrichment(conn: &Connection, file_id: FileId, classification: &str) {
+        crate::enrichment::record_enrichment(
+            conn,
+            file_id,
+            &crate::enrichment::FileEnrichment {
+                classification: Some(classification.into()),
+                enriched_at_unix: 1_000,
+                enrichment_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record enrichment");
+    }
+
+    #[test]
+    fn a_classification_filter_excludes_non_matching_rows() {
+        let (conn, pdf) = db_with_file("/a/report.pdf");
+        let mut i = Interner::new();
+        let docx = ensure_dir_chain(&conn, &mut i, Path::new("/a/report.docx")).expect("docx");
+
+        append(&conn, &NewEvent::now(pdf, EventKind::Created)).expect("append pdf");
+        append(&conn, &NewEvent::now(docx, EventKind::Created)).expect("append docx");
+
+        record_enrichment(&conn, pdf, "business");
+        record_enrichment(&conn, docx, "personal");
+
+        let entries = timeline(
+            &conn,
+            &TimelineQuery { classification: Some("business".into()), ..Default::default() },
+        )
+        .expect("timeline");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, pdf);
+        assert_eq!(entries[0].classification.as_deref(), Some("business"));
+    }
+
+    /// Same reasoning as `a_facet_filter_excludes_rows_with_null_metadata`,
+    /// for the second LEFT JOIN: a file with no `file_enrichment` row must
+    /// not match a classification filter just because the column is absent.
+    #[test]
+    fn a_classification_filter_excludes_rows_with_null_enrichment() {
+        let (conn, file) = db_with_file("/a/unseen.pdf");
+        append(&conn, &NewEvent::now(file, EventKind::Created)).expect("append");
+
+        let entries = timeline(
+            &conn,
+            &TimelineQuery { classification: Some("business".into()), ..Default::default() },
+        )
+        .expect("timeline");
+        assert!(
+            entries.is_empty(),
+            "a row with no enrichment matched a classification filter: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn combining_a_metadata_facet_and_classification_narrows_both_ways() {
+        let (conn, pdf) = db_with_file("/a/report.pdf");
+        record_metadata(&conn, pdf, "pdf");
+        record_enrichment(&conn, pdf, "business");
+        append(&conn, &NewEvent::now(pdf, EventKind::Created)).expect("append pdf");
+
+        let mut i = Interner::new();
+        let docx = ensure_dir_chain(&conn, &mut i, Path::new("/a/report.docx")).expect("docx");
+        record_metadata(&conn, docx, "pdf");
+        record_enrichment(&conn, docx, "personal");
+        append(&conn, &NewEvent::now(docx, EventKind::Created)).expect("append docx");
+
+        let entries = timeline(
+            &conn,
+            &TimelineQuery {
+                doc_type: Some("pdf".into()),
+                classification: Some("business".into()),
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, pdf);
+        assert_eq!(entries[0].doc_type.as_deref(), Some("pdf"));
+        assert_eq!(entries[0].classification.as_deref(), Some("business"));
     }
 
     #[test]

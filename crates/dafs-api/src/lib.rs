@@ -214,6 +214,7 @@ struct EventsQuery {
     author: Option<String>,
     language: Option<String>,
     git_branch: Option<String>,
+    classification: Option<String>,
 }
 
 /// Cap on any single facet-filter query-string value.
@@ -250,7 +251,9 @@ async fn events(
     }
 
     for field in
-        [&query.doc_type, &query.author, &query.language, &query.git_branch].into_iter().flatten()
+        [&query.doc_type, &query.author, &query.language, &query.git_branch, &query.classification]
+            .into_iter()
+            .flatten()
     {
         if field.len() > MAX_FACET_FILTER_LEN {
             return (StatusCode::BAD_REQUEST, Json(ApiError { error: "facet filter too long" }))
@@ -270,6 +273,7 @@ async fn events(
             query.author.as_deref(),
             query.language.as_deref(),
             query.git_branch.as_deref(),
+            query.classification.as_deref(),
         )
     })
     .await;
@@ -343,7 +347,10 @@ async fn facets(
     // Validate before touching the store, same reasoning as `kind` on
     // `/events`: an unrecognised field is the caller's error, not an empty
     // result that reads as "this facet has no values".
-    if !matches!(query.field.as_str(), "doc_type" | "author" | "language" | "git_branch") {
+    if !matches!(
+        query.field.as_str(),
+        "doc_type" | "author" | "language" | "git_branch" | "classification"
+    ) {
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: "unknown facet field" }))
             .into_response();
     }
@@ -867,6 +874,28 @@ mod tests {
         let (status, body) = get(router(state_with_events(3)), "/facets?field=doc_type").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "[]", "the fake store has no doc_type values: {body}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_classification_filter_on_events_is_rejected() {
+        let (status, body) = get(
+            router(state_with_events(3)),
+            &format!("/events?classification={}", "a".repeat(300)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an oversized classification filter should be rejected, not silently truncated: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn facets_accepts_the_classification_field() {
+        let (status, body) =
+            get(router(state_with_events(3)), "/facets?field=classification").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]", "the fake store has no classification values: {body}");
     }
 
     #[tokio::test]

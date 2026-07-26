@@ -83,6 +83,13 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 /// long enough that an idle daemon is not spinning on an empty table.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
+/// A file's body text needs real signal before an LLM summarization prompt
+/// is worth a network round trip over it — well above
+/// `dafs_extract::office::MIN_CHARS_FOR_LANG_DETECT`'s 40-char floor for a
+/// mere language guess, since summarizing takes more than a few words of
+/// context. A short file (a stub, a one-line note) is not worth enqueuing.
+const MIN_CHARS_FOR_ENRICHMENT: usize = 300;
+
 /// `crates/dafs-pdf-worker`'s binary name, resolved as a sibling of this
 /// process's own executable — cargo places every workspace binary in the
 /// same `target/<profile>/` directory, and the Nix package (`flake.nix`)
@@ -116,7 +123,13 @@ impl ExtractWorker {
 /// Safe to call with an empty queue — which is the common case at startup
 /// before `requeue_stale` or a live watch event has put anything in it: the
 /// worker just polls an empty table harmlessly until there is work.
-pub fn spawn(db_path: &std::path::Path) -> anyhow::Result<ExtractWorker> {
+///
+/// `enrichment_enabled` is whether the daemon was given an LLM endpoint at
+/// all (`main.rs`'s `llm_config.is_some()`) — threaded through as a bare
+/// `bool` rather than importing `dafs_enrich::Config` here, since this
+/// module otherwise has no reason to know anything about LLM configuration;
+/// it only needs to know whether to enqueue, not how enrichment itself works.
+pub fn spawn(db_path: &std::path::Path, enrichment_enabled: bool) -> anyhow::Result<ExtractWorker> {
     use anyhow::Context as _;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -126,7 +139,7 @@ pub fn spawn(db_path: &std::path::Path) -> anyhow::Result<ExtractWorker> {
 
     let handle = std::thread::Builder::new()
         .name("dafs-extract".into())
-        .spawn(move || run(&db_path, &thread_stop, &pdf_worker_bin))
+        .spawn(move || run(&db_path, &thread_stop, &pdf_worker_bin, enrichment_enabled))
         .context("spawning the extraction worker thread")?;
 
     Ok(ExtractWorker { stop, handle: Some(handle) })
@@ -154,7 +167,12 @@ fn pdf_worker_path() -> PathBuf {
 }
 
 /// The worker's main loop, run on its own connection and its own thread.
-fn run(db_path: &std::path::Path, stop: &AtomicBool, pdf_worker_bin: &Path) {
+fn run(
+    db_path: &std::path::Path,
+    stop: &AtomicBool,
+    pdf_worker_bin: &Path,
+    enrichment_enabled: bool,
+) {
     let conn = match dafs_store::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -182,7 +200,7 @@ fn run(db_path: &std::path::Path, stop: &AtomicBool, pdf_worker_bin: &Path) {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            process_one(&conn, file_id, pdf_worker_bin);
+            process_one(&conn, file_id, pdf_worker_bin, enrichment_enabled);
         }
     }
 }
@@ -190,7 +208,12 @@ fn run(db_path: &std::path::Path, stop: &AtomicBool, pdf_worker_bin: &Path) {
 /// Extract one queued file, recording either its metadata or nothing —
 /// extraction failures are never propagated past a log line, since
 /// `MAX_ATTEMPTS` is what bounds their cost, not the caller.
-fn process_one(conn: &Connection, file_id: FileId, pdf_worker_bin: &Path) {
+fn process_one(
+    conn: &Connection,
+    file_id: FileId,
+    pdf_worker_bin: &Path,
+    enrichment_enabled: bool,
+) {
     // Recorded before any work happens at all — see the module docs on why
     // this ordering, not "after extraction fails", is what crash-consistency
     // requires here.
@@ -223,12 +246,19 @@ fn process_one(conn: &Connection, file_id: FileId, pdf_worker_bin: &Path) {
     match result {
         Some(Ok(extraction)) => {
             let metadata = to_file_metadata(extraction);
-            if let Err(e) = dafs_store::metadata::record_extraction(conn, file_id, &metadata) {
-                tracing::warn!(
-                    file_id,
-                    path = %path.display(),
-                    "could not record extraction result: {e}"
-                );
+            match dafs_store::metadata::record_extraction(conn, file_id, &metadata) {
+                // Also what makes a re-extracted file (modified, or an
+                // extractor-version bump) get re-enriched: it comes back
+                // through this same success path every time, not just on
+                // first extraction.
+                Ok(()) => maybe_enqueue_enrichment(conn, file_id, &metadata, enrichment_enabled),
+                Err(e) => {
+                    tracing::warn!(
+                        file_id,
+                        path = %path.display(),
+                        "could not record extraction result: {e}"
+                    );
+                }
             }
         }
         Some(Err(e)) => {
@@ -282,6 +312,7 @@ struct PdfWorkerResponse {
     page_count: Option<i64>,
     word_count: Option<i64>,
     language: Option<String>,
+    body_text: Option<String>,
     error: Option<String>,
 }
 
@@ -387,6 +418,7 @@ fn extract_pdf_with_deadline(
         language: response.language,
         page_count: response.page_count,
         word_count: response.word_count,
+        body_text: response.body_text,
         ..Default::default()
     };
     // The daemon bypasses `dafs_extract::extract` entirely for PDFs, so this
@@ -422,6 +454,37 @@ fn write_frame(w: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     w.flush()
 }
 
+/// Whether a just-extracted file's body text clears
+/// [`MIN_CHARS_FOR_ENRICHMENT`] — `None` (images, git-only facts) is not
+/// enough, the same as any count below the floor.
+fn has_enough_text_to_enrich(metadata: &FileMetadata) -> bool {
+    metadata.body_text.as_deref().map(|t| t.chars().count()).unwrap_or(0)
+        >= MIN_CHARS_FOR_ENRICHMENT
+}
+
+/// After a successful extraction, enqueue the file for LLM enrichment if
+/// enrichment is configured at all and there is enough text to be worth a
+/// network round trip. Split out from [`process_one`]'s match arm purely so
+/// this decision is unit-testable without needing a real document type
+/// (docx/xlsx/pptx, or a PDF via the pdfium worker) to run through
+/// `dafs_extract::extract` — plain text files, this module's simplest test
+/// fixture, never populate `body_text` at all (see `dafs_extract::extract`'s
+/// own doc-type match), so exercising this decision through a real
+/// extraction would need fixtures this module has no other reason to build.
+fn maybe_enqueue_enrichment(
+    conn: &Connection,
+    file_id: FileId,
+    metadata: &FileMetadata,
+    enrichment_enabled: bool,
+) {
+    if !enrichment_enabled || !has_enough_text_to_enrich(metadata) {
+        return;
+    }
+    if let Err(e) = dafs_store::enrichment::enqueue(conn, file_id, crate::now_unix()) {
+        tracing::warn!(file_id, "could not enqueue a file for enrichment: {e}");
+    }
+}
+
 /// Field-for-field except for `doc_type` (needs its stored string form) and
 /// the two bookkeeping fields the store tracks that extraction itself has no
 /// opinion on.
@@ -439,6 +502,7 @@ fn to_file_metadata(e: dafs_extract::Extraction) -> FileMetadata {
         git_head_commit: e.git_head_commit,
         git_head_author: e.git_head_author,
         git_head_at_unix: e.git_head_at_unix,
+        body_text: e.body_text,
         extracted_at_unix: crate::now_unix(),
         extractor_version: dafs_extract::EXTRACTOR_VERSION,
     }
@@ -482,7 +546,7 @@ mod tests {
         // false and this path is never spawned.
         let no_pdf_worker = Path::new("/nonexistent/dafs-pdf-worker");
         for file_id in dafs_store::metadata::pending(&conn, BATCH).expect("pending") {
-            process_one(&conn, file_id, no_pdf_worker);
+            process_one(&conn, file_id, no_pdf_worker, false);
         }
 
         assert!(dafs_store::metadata::pending(&conn, BATCH).expect("pending").is_empty());
@@ -510,7 +574,7 @@ mod tests {
 
         // Must not panic, and must not leave the queue entry silently gone —
         // the attempt is recorded but the row stays for the next retry.
-        process_one(&conn, file_id, Path::new("/nonexistent/dafs-pdf-worker"));
+        process_one(&conn, file_id, Path::new("/nonexistent/dafs-pdf-worker"), false);
 
         assert!(
             dafs_store::metadata::get(&conn, file_id).expect("get").is_none(),
@@ -537,6 +601,49 @@ mod tests {
         assert_eq!(metadata.doc_type.as_deref(), Some("docx"));
         assert_eq!(metadata.title.as_deref(), Some("Report"));
         assert_eq!(metadata.extractor_version, dafs_extract::EXTRACTOR_VERSION);
+    }
+
+    #[test]
+    fn has_enough_text_to_enrich_respects_the_floor() {
+        let none = FileMetadata { body_text: None, ..Default::default() };
+        assert!(!has_enough_text_to_enrich(&none), "no body text is never enough");
+
+        let short = FileMetadata { body_text: Some("short".into()), ..Default::default() };
+        assert!(!has_enough_text_to_enrich(&short), "below the floor must not pass");
+
+        let long = FileMetadata {
+            body_text: Some("x".repeat(MIN_CHARS_FOR_ENRICHMENT)),
+            ..Default::default()
+        };
+        assert!(has_enough_text_to_enrich(&long), "at the floor must pass");
+    }
+
+    #[test]
+    fn maybe_enqueue_enrichment_only_enqueues_when_enabled_and_long_enough() {
+        let conn = dafs_store::open_in_memory().expect("open");
+        let mut i = Interner::new();
+        let file_id = ensure_dir_chain(&conn, &mut i, Path::new("/a/report.docx")).expect("id");
+        let long = FileMetadata { body_text: Some("x".repeat(500)), ..Default::default() };
+        let short = FileMetadata { body_text: Some("short".into()), ..Default::default() };
+
+        maybe_enqueue_enrichment(&conn, file_id, &short, true);
+        assert!(
+            dafs_store::enrichment::pending(&conn, 10).expect("pending").is_empty(),
+            "short text must not be enqueued even when enrichment is enabled"
+        );
+
+        maybe_enqueue_enrichment(&conn, file_id, &long, false);
+        assert!(
+            dafs_store::enrichment::pending(&conn, 10).expect("pending").is_empty(),
+            "long text must not be enqueued when enrichment is disabled"
+        );
+
+        maybe_enqueue_enrichment(&conn, file_id, &long, true);
+        assert_eq!(
+            dafs_store::enrichment::pending(&conn, 10).expect("pending"),
+            vec![file_id],
+            "long text with enrichment enabled must be enqueued"
+        );
     }
 
     #[test]
