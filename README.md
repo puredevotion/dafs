@@ -115,6 +115,29 @@ corpus is not in this repository and cannot be — it's referenced by content
 hash from a manifest, so published numbers name exactly which revision produced
 them.
 
+## Installing
+
+Prebuilt Linux binaries (x86_64, aarch64) are attached to each
+[release](https://github.com/puredevotion/dafs/releases):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/puredevotion/dafs/main/scripts/install.sh | sh
+```
+
+That pipes a script straight into your shell — inspect it first if you'd
+rather not do that blind:
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/puredevotion/dafs/main/scripts/install.sh
+less install.sh   # read it
+sh install.sh
+```
+
+It downloads the matching release tarball, verifies its sha256 checksum
+before extracting anything, and installs to `~/.local/bin/dafs`
+(override with `DAFS_INSTALL_DIR`). Pin a specific version with
+`sh install.sh --version v0.0.1`.
+
 ## Building
 
 ```sh
