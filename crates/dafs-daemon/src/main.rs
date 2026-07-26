@@ -41,6 +41,30 @@ static GLOBAL: dafs_alloc::Allocator = dafs_alloc::ALLOCATOR;
 
 #[derive(Parser, Debug)]
 #[command(name = "dafs", version, about = "Distributed AI-native filesystem daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    args: Args,
+}
+
+/// Subcommands live alongside the daemon's flat flags rather than replacing
+/// them: `command: None` must behave exactly as `dafs --watch ...` always
+/// has, so existing invocations and the README's examples keep working
+/// unchanged.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Replace this binary with the latest (or `--check-only` compare
+    /// against the) release, via scripts/install.sh embedded at compile time.
+    SelfUpdate {
+        /// Report whether an update is available without installing it.
+        #[arg(long)]
+        check_only: bool,
+    },
+}
+
+#[derive(clap::Args, Debug)]
 struct Args {
     /// Directory for the metadata database and, later, the object store.
     #[arg(long, env = "DAFS_DATA_DIR", default_value = "./.dafs")]
@@ -79,7 +103,13 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+
+    if let Some(Command::SelfUpdate { check_only }) = cli.command {
+        return self_update(check_only);
+    }
+
+    let args = cli.args;
     let log_handle = init_tracing(&args.log)?;
 
     // Single-threaded until there is concurrent work to justify otherwise. A
@@ -309,6 +339,55 @@ fn apply_change(
     }
 
     Ok(())
+}
+
+/// The installer script, embedded at compile time.
+///
+/// `dafs self-update` shells out to this instead of reimplementing
+/// fetch/verify/replace in Rust: one source of truth with
+/// `scripts/install.sh`'s normal install path, and zero new dependencies
+/// (no HTTP client, no TLS stack) in a binary with a 32 MB idle-RSS ceiling,
+/// for a code path that runs rarely.
+const INSTALL_SCRIPT: &str = include_str!("../../../scripts/install.sh");
+
+/// Run the embedded installer script against this binary.
+///
+/// Not async and does not touch the store, scanner, or API — self-update
+/// exits before any of that is opened.
+fn self_update(check_only: bool) -> anyhow::Result<()> {
+    let current_exe = std::env::current_exe().context("resolving the running binary's path")?;
+
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-s").arg("--");
+    if check_only {
+        cmd.arg("--check-only");
+    } else {
+        cmd.arg("--self-update").arg("--target-path").arg(&current_exe);
+    }
+    cmd.arg("--current-version").arg(env!("CARGO_PKG_VERSION"));
+    cmd.stdin(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().context("spawning sh to run the installer script")?;
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped since it was just set above")
+            .write_all(INSTALL_SCRIPT.as_bytes())
+            .context("writing the installer script to sh's stdin")?;
+    }
+    let status = child.wait().context("waiting for the installer script")?;
+
+    match status.code() {
+        Some(0) => Ok(()),
+        // install.sh's own convention: exit 3 means `--check-only` found an
+        // update but did not apply it — not a failure, but worth a distinct
+        // exit code so scripts driving `dafs self-update --check-only` can
+        // tell "up to date" from "update available" without parsing stdout.
+        Some(3) if check_only => std::process::exit(3),
+        other => anyhow::bail!("self-update script failed (exit code {other:?})"),
+    }
 }
 
 /// Resolve when the process is asked to stop.
