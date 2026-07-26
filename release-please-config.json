@@ -5,6 +5,7 @@
   "bump-patch-for-minor-pre-major": true,
   "skip-github-release": true,
   "draft-pull-request": false,
+  "plugins": ["cargo-workspace"],
   "packages": {
     ".": {
       "package-name": "dafs"
