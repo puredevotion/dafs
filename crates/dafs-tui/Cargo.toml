@@ -10,6 +10,10 @@ authors.workspace = true
 # Not published to crates.io: see dafs-alloc's Cargo.toml for why.
 publish = false
 
+[lib]
+name = "dafs_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dafs-tui"
 path = "src/main.rs"

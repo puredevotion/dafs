@@ -19,12 +19,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-mod capabilities;
-mod client;
-mod ui;
-
-use capabilities::Capabilities;
-use client::Client;
+use dafs_tui::capabilities::Capabilities;
+use dafs_tui::client::{self, Client};
+use dafs_tui::ui;
 
 /// Samples of `dafs_resident_bytes` kept for the trend sparkline. At the
 /// default 1s refresh that's a 2-minute window — enough to see a scan spike
