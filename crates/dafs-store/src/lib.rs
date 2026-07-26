@@ -4,7 +4,11 @@
 //! minimal schema. M01 adds the real tables: interned path components, files,
 //! and the append-only event log the timeline reads from. M02a adds
 //! `file_metadata` (deterministic extraction output) and `extraction_queue`
-//! (the durable work list that drives it) — see the `metadata` module.
+//! (the durable work list that drives it) — see the `metadata` module. M02b
+//! adds `file_metadata.body_text` (M02a's own extracted text, exposed for
+//! reuse rather than re-parsed) and `file_enrichment`/`enrichment_queue`
+//! (LLM-derived fields, kept in their own table — see the `enrichment`
+//! module).
 //!
 //! # Paths are interned, not stored
 //!
@@ -37,6 +41,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+pub mod enrichment;
 pub mod events;
 pub mod metadata;
 pub mod paths;
@@ -226,6 +231,53 @@ const MIGRATIONS: &[Migration] = &[
         ) STRICT;
 
         CREATE INDEX extraction_queue_order ON extraction_queue(queued_at_unix ASC);
+    ",
+    },
+    Migration {
+        version: 4,
+        name: "enrichment",
+        sql: "
+        -- Deterministic extraction output M02a computed internally (to derive
+        -- word_count/language) but never persisted. Added here, not in M02a's
+        -- migration — that one is never edited once shipped — so M02b's
+        -- enrichment worker can read a file's text straight back out of the
+        -- store instead of re-parsing the original file a second time.
+        ALTER TABLE file_metadata ADD COLUMN body_text TEXT;
+
+        -- LLM-derived fields live in their own table, never as columns on
+        -- file_metadata: M02a's crate and schema stay LLM-free in substance,
+        -- not just in comments, and enrichment can be independently enabled,
+        -- disabled, or re-run without ever touching M02a's shipped schema.
+        --
+        -- Same replaceable-cache reasoning as file_metadata: re-enrichment
+        -- overwrites the row rather than appending a new fact.
+        CREATE TABLE file_enrichment (
+            file_id            INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            summary            TEXT,
+            -- JSON arrays, stored as text — same reasoning `events.kind` being
+            -- TEXT gives: readable in a bare sqlite3 shell during an incident.
+            keywords           TEXT,
+            entities           TEXT,
+            classification     TEXT,
+            enriched_at_unix   INTEGER NOT NULL,
+            -- Bumped whenever the prompt/schema changes meaningfully, so an
+            -- upgrade can find and reprocess everything a prior version
+            -- enriched — same role as file_metadata.extractor_version.
+            enrichment_version INTEGER NOT NULL
+        ) STRICT;
+
+        -- Same durable-queue shape as extraction_queue, and the same
+        -- attempt_count poison-file cap. Unlike extraction_queue, nothing
+        -- enqueues here unconditionally: a file only ever lands in this queue
+        -- when enrichment is configured, driven from the extraction worker
+        -- after a successful extraction with enough text to be worth sending.
+        CREATE TABLE enrichment_queue (
+            file_id        INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            queued_at_unix INTEGER NOT NULL,
+            attempt_count  INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+
+        CREATE INDEX enrichment_queue_order ON enrichment_queue(queued_at_unix ASC);
     ",
     },
 ];

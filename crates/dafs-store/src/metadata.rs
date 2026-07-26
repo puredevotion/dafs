@@ -28,6 +28,12 @@ pub struct FileMetadata {
     pub git_head_commit: Option<String>,
     pub git_head_author: Option<String>,
     pub git_head_at_unix: Option<i64>,
+    /// M02a's own extracted body text (capped), kept so M02b's enrichment
+    /// worker can read it straight back rather than re-parsing the original
+    /// file a second time. `None` for anything an extractor didn't produce
+    /// text for (images, git-only facts) — the same condition that keeps
+    /// those files out of the enrichment queue in the first place.
+    pub body_text: Option<String>,
     pub extracted_at_unix: i64,
     pub extractor_version: u32,
 }
@@ -81,8 +87,8 @@ pub fn record_extraction(
         "INSERT INTO file_metadata
              (file_id, doc_type, title, author, language, page_count, word_count,
               image_taken_at_unix, image_camera_model, git_branch, git_head_commit,
-              git_head_author, git_head_at_unix, extracted_at_unix, extractor_version)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+              git_head_author, git_head_at_unix, body_text, extracted_at_unix, extractor_version)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(file_id) DO UPDATE SET
              doc_type            = excluded.doc_type,
              title               = excluded.title,
@@ -96,6 +102,7 @@ pub fn record_extraction(
              git_head_commit     = excluded.git_head_commit,
              git_head_author     = excluded.git_head_author,
              git_head_at_unix    = excluded.git_head_at_unix,
+             body_text           = excluded.body_text,
              extracted_at_unix   = excluded.extracted_at_unix,
              extractor_version   = excluded.extractor_version",
         params![
@@ -112,6 +119,7 @@ pub fn record_extraction(
             m.git_head_commit,
             m.git_head_author,
             m.git_head_at_unix,
+            m.body_text,
             m.extracted_at_unix,
             m.extractor_version,
         ],
@@ -219,7 +227,7 @@ pub fn get(conn: &Connection, file_id: FileId) -> Result<Option<FileMetadata>, S
     conn.query_row(
         "SELECT doc_type, title, author, language, page_count, word_count,
                 image_taken_at_unix, image_camera_model, git_branch, git_head_commit,
-                git_head_author, git_head_at_unix, extracted_at_unix, extractor_version
+                git_head_author, git_head_at_unix, body_text, extracted_at_unix, extractor_version
            FROM file_metadata WHERE file_id = ?1",
         [file_id],
         |r| {
@@ -236,8 +244,9 @@ pub fn get(conn: &Connection, file_id: FileId) -> Result<Option<FileMetadata>, S
                 git_head_commit: r.get(9)?,
                 git_head_author: r.get(10)?,
                 git_head_at_unix: r.get(11)?,
-                extracted_at_unix: r.get(12)?,
-                extractor_version: r.get(13)?,
+                body_text: r.get(12)?,
+                extracted_at_unix: r.get(13)?,
+                extractor_version: r.get(14)?,
             })
         },
     )

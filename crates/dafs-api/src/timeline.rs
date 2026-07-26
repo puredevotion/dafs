@@ -74,6 +74,14 @@ pub struct TimelineItem {
     pub git_head_author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head_at_unix: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entities: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
 }
 
 /// What the timeline handler needs from a store.
@@ -92,6 +100,7 @@ pub trait TimelineStore: Send + Sync + 'static {
         author: Option<&str>,
         language: Option<&str>,
         git_branch: Option<&str>,
+        classification: Option<&str>,
     ) -> Result<Vec<TimelineItem>, String>;
 
     /// Event and file counts, plus the extraction queue depth, for `/metrics`
@@ -100,9 +109,10 @@ pub trait TimelineStore: Send + Sync + 'static {
 
     /// Distinct values (and counts) of one facet column, most common first —
     /// what populates a `/facets`-backed filter dropdown. `field` is one of
-    /// `doc_type`/`author`/`language`/`git_branch`; validating that is the
-    /// caller's job (the HTTP handler), same division of labour `events`
-    /// already uses for `kind` — this trait method is not the place to 400.
+    /// `doc_type`/`author`/`language`/`git_branch`/`classification`;
+    /// validating that is the caller's job (the HTTP handler), same division
+    /// of labour `events` already uses for `kind` — this trait method is not
+    /// the place to 400.
     fn facets(&self, field: &str) -> Result<Vec<(String, i64)>, String>;
 }
 
@@ -139,6 +149,7 @@ pub(crate) mod testing {
             author: Option<&str>,
             language: Option<&str>,
             git_branch: Option<&str>,
+            classification: Option<&str>,
         ) -> Result<Vec<TimelineItem>, String> {
             if self.fail {
                 return Err("store is broken".into());
@@ -152,6 +163,7 @@ pub(crate) mod testing {
                 .filter(|i| author.is_none_or(|a| i.author.as_deref() == Some(a)))
                 .filter(|i| language.is_none_or(|l| i.language.as_deref() == Some(l)))
                 .filter(|i| git_branch.is_none_or(|g| i.git_branch.as_deref() == Some(g)))
+                .filter(|i| classification.is_none_or(|c| i.classification.as_deref() == Some(c)))
                 .take(limit as usize)
                 .cloned()
                 .collect())
@@ -180,6 +192,7 @@ pub(crate) mod testing {
                     "author" => i.author.clone(),
                     "language" => i.language.clone(),
                     "git_branch" => i.git_branch.clone(),
+                    "classification" => i.classification.clone(),
                     _ => None,
                 }
             };

@@ -73,8 +73,12 @@ kept only as provenance; the substance is reproduced here in full.
    `dafs` binary. This applies to every future milestone that adds a native/binary
    dependency, not just pdfium — checked per-milestone against §7 item 5's size question,
    and against the unavoidable exceptions below:
-   - **Too large to vendor at build time**: M02b/M08's LLM weights (multi-GB) cannot be
-     `include_bytes!`'d the way pdfium's ~tens-of-MB library can — see §7 item 5.
+   - **Resolved by not vendoring at all**: M02b's original shape (an in-process/child-process
+     local model) would have hit this exception — multi-GB weights cannot be
+     `include_bytes!`'d the way pdfium's ~tens-of-MB library can. M02b instead talks to a
+     user-configured OpenAI-compatible endpoint (§7 item 5 has the resolved decision); dafs
+     itself never runs or vendors a model, so this exception ended up moot for M02b. M08
+     (AI assistant) reuses the same client and inherits the same answer.
    - **Cannot be vendored at all**: FUSE (M06/M11a/M11b) needs kernel-level support
      (a kernel module plus, on macOS, a separate macFUSE install) that no amount of
      bundling reaches; Windows CFAPI (M12) is a host-OS-provided API, not a library to
@@ -207,7 +211,7 @@ Sizes are solo-dev evenings/weekends estimates, for ordering purposes only.
 | M01 | M01 | Local timeline | 3–5 wk | Unchanged. Read-only observer, no risk to user data. |
 | **M01a** | — | **Ship it: install, monitor, update** | 1 wk | New. Installer script, release automation (release-please + Dagger build/SBOM parity), a read-only status TUI, and `dafs self-update`. Unlike M00, this is genuine user-facing value — installing without a `cargo build` and watching the daemon run are things a user directly does — not infrastructure-for-its-own-sake. Gated here because a user who can't install or observe M01 has no reason to still have it installed by M02a. |
 | **M02a** | M02 | **Deterministic metadata + browse** | 2 wk | Split. PDF text, Office, EXIF, git, filename/FS metadata. **No LLM.** Gains its own surface (§4.1). |
-| **M02b** | M02 | **Local LLM enrichment** | 3 wk | Split. Summary, keywords, entities, classification. De-risks the project's biggest unknown — Gemma-4B on CPU, no GPU — *after* M02a already ships value. |
+| **M02b** | M02 | **LLM enrichment via an OpenAI-compatible client** | 3 wk | Split. Summary, keywords, entities, classification. Originally scoped as an in-process local model (Gemma-4B, CPU-only); resolved instead to a thin client against a user-configured OpenAI-compatible endpoint — see §7 item 5 for why. De-risks the project's biggest unknown — usable enrichment quality/latency with no model dafs manages itself — *after* M02a already ships value. |
 | M03 | M03 | Semantic search | 3–4 wk | Unchanged. First "wow" milestone. |
 | **M04** | **M08** | **Version history** | 2–3 wk | ↑4. Strongest single-device value; needs no FUSE/CAS/network. §3.2 |
 | **M05** | **(M15)** | **Device identity + pairing** | 2 wk | Extracted from M15. Gate on all networking. §3.1 |
@@ -423,18 +427,20 @@ The five open questions from the first draft of this document, now answered.
 4. **Windows memory story (M12).** §8's budget is measured on Linux. CFAPI placeholder
    hydration has its own working-set behaviour and no `madvise` equivalent. Needs its own
    ceiling, set at M12.
-5. **LLM model distribution (M02b/M08) — flagged, not decided.** §2 item 9's vendoring
-   principle explicitly cannot apply here the way it does to pdfium: a Gemma-class 4B
+5. **LLM model distribution (M02b/M08) — resolved at M02b.** §2 item 9's vendoring
+   principle explicitly could not apply here the way it does to pdfium: a Gemma-class 4B
    model's weights are gigabytes, not tens of megabytes, and `include_bytes!`-ing that into
    a committed binary would make every clone, CI run, and release artifact carry a
-   multi-gigabyte payload whether or not the AI worker is ever used. The likely shape is a
-   runtime fetch-and-cache-once (hash-pinned URL, verified checksum, cached outside git,
-   never touching the repo) rather than a build-time embed — but that means the AI worker
-   genuinely needs a network connection *the first time* it runs, on whichever device asks
-   for enrichment, which is a real deployment-experience question for the NAS/homelab
-   target hardware (§0's "no GPU" audience) that §2 item 9 doesn't answer by itself. Needs
-   its own decision at M02b, with the actual model size and a first-run UX sketched out
-   before building it, not assumed.
+   multi-gigabyte payload whether or not enrichment is ever used. Rather than solve that
+   (a runtime fetch-and-cache-once was the leading candidate, with its own first-run-needs-
+   network deployment question for the NAS/homelab target hardware), M02b sidesteps it: dafs
+   never runs or vendors a model at all. It is a thin client against a user-configured
+   OpenAI-compatible chat-completions endpoint — a local llama.cpp/Ollama/vLLM server, or a
+   hosted API — so the model, wherever it runs, is entirely outside dafs's build and
+   deployment story. This also fits the architecture better than embedding ever would: the
+   AI plane (§2 item 1's three independent data planes) can now genuinely run on different,
+   more capable hardware than the NAS running dafs itself. M08 (AI assistant) reuses the
+   same client.
 
 ---
 
@@ -455,13 +461,15 @@ process has been idle for 60s.**
 | Daemon idle (watcher + event store + API) | **≤ 32 MB** | The baseline. No index resident. |
 | Daemon, steady-state with search served | **≤ 96 MB** | Includes quantized vectors (§8.3). |
 | Peak during initial 1M-file scan | **≤ 128 MB** | Bounded by streaming, not corpus size (§8.2). |
-| AI worker, resident while enriching | **≤ 4 GB** | #214's figure, kept. A 4B model's weights dominate and are irreducible. |
-| AI worker, not enriching | **0** | Separate process, spawned on demand, exits when the queue drains. Not resident. |
+| Enrichment client, resident while a request is in flight | **negligible** | §7 item 5: M02b never runs a model — it's an HTTP client (`ureq`) against a user-configured endpoint. No weights, no inference engine, in this process ever. |
+| Enrichment client, idle | **0** | No worker thread at all when unconfigured (§7 item 5) — not merely a separate process that exits, no process/thread exists to begin with. |
 
-The last row is the single biggest win and is a process-architecture decision, not an
-optimization: the LLM must **not** live inside the daemon. #214 already separates the AI
-pipeline as its own plane — this makes that separation a memory boundary too, so the
-steady-state cost of having AI features is zero when no enrichment is pending.
+#214's original `≤4 GB` "AI worker, resident while enriching" figure no longer applies to
+this process: the model, if any, runs on whichever machine the user pointed the enrichment
+client at, which may not even be this host. #214 already separates the AI pipeline as its
+own plane — M02b's client-only design makes that separation a memory boundary too, more
+completely than the original in-process-worker design would have, since there is now no
+resident model to bound at all on the machine running dafs.
 
 ### 8.2 Reaching it — scan and event path
 

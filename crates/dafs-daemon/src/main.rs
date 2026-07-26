@@ -29,12 +29,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
 
 mod control_client;
 mod detach;
+mod enrich_worker;
 mod extract_worker;
 mod pidfile;
 mod store_adapter;
@@ -145,6 +147,38 @@ struct Args {
     /// when stdin isn't a terminal to prompt on; optional otherwise.
     #[arg(long, value_enum, env = "DAFS_ON_RUNNING")]
     on_running: Option<OnRunning>,
+
+    /// Base URL of an OpenAI-compatible chat-completions endpoint (M02b LLM
+    /// enrichment). No default, deliberately — see `dafs_enrich`'s module
+    /// docs on why there is no default endpoint: enrichment stays off,
+    /// exactly like an empty `--watch` list already means "watch nothing"
+    /// for scanning, until this is set to a real endpoint.
+    #[arg(long = "llm-base-url", env = "DAFS_LLM_BASE_URL", requires = "llm_model")]
+    llm_base_url: Option<String>,
+
+    /// API key for the LLM endpoint, if it needs one. Never logged — unlike
+    /// `llm_base_url`, which `run` logs out loud on startup, because a
+    /// privacy-relevant fact (file text leaving the machine) is worth
+    /// stating plainly while a credential never needs to be.
+    #[arg(long = "llm-api-key", env = "DAFS_LLM_API_KEY")]
+    llm_api_key: Option<String>,
+
+    /// Model name to request from the LLM endpoint. Required together with
+    /// `--llm-base-url` (via `requires` on both) rather than silently
+    /// no-opping on a half-set pair: a base URL with no model to ask for is
+    /// a configuration mistake worth failing fast on at startup, not a
+    /// state worth quietly tolerating.
+    #[arg(long = "llm-model", env = "DAFS_LLM_MODEL", requires = "llm_base_url")]
+    llm_model: Option<String>,
+
+    /// Seconds before one enrichment call's own request is abandoned.
+    /// A field, not a fixed constant like `extract_worker::EXTRACT_TIMEOUT`,
+    /// because LLM generation over a real network call can take tens of
+    /// seconds depending on the model and hardware on the other end — see
+    /// `dafs_enrich::Config::timeout`'s own doc comment for why that varies
+    /// by deployment in a way a bounded local parse never does.
+    #[arg(long = "llm-timeout-secs", env = "DAFS_LLM_TIMEOUT_SECS", default_value_t = 120)]
+    llm_timeout_secs: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -229,8 +263,38 @@ async fn run(
     state.set_ready();
     tracing::info!(schema_version, roots = ?args.watch, "ready");
 
+    // `requires` on both `llm_base_url` and `llm_model` (see `Args`) means
+    // clap has already rejected a half-set pair by the time we're here, so
+    // either both are present or neither is — the `expect` below is a
+    // consequence of that parse-time invariant, not a runtime guess.
+    let llm_config = args.llm_base_url.clone().map(|base_url| dafs_enrich::Config {
+        base_url,
+        api_key: args.llm_api_key.clone(),
+        model: args.llm_model.clone().expect("clap requires ties llm_model to llm_base_url"),
+        timeout: Duration::from_secs(args.llm_timeout_secs),
+    });
+
+    if let Some(config) = &llm_config {
+        // A privacy-relevant fact — file text is about to leave this
+        // machine — and must not be silent the way a merely-technical log
+        // line could be.
+        tracing::warn!(
+            base_url = %config.base_url,
+            "LLM enrichment enabled: file text will be sent to this endpoint"
+        );
+    }
+
     let observer = spawn_observer(&args, &db_path, shared_roots, command_rx)?;
-    let extract_worker = extract_worker::spawn(&db_path).context("spawning extraction worker")?;
+    let extract_worker = extract_worker::spawn(&db_path, llm_config.is_some())
+        .context("spawning extraction worker")?;
+    let enrich_worker = match &llm_config {
+        Some(config) => Some(
+            enrich_worker::spawn(&db_path, config.clone()).context("spawning enrichment worker")?,
+        ),
+        // No thread, no connection, no queue polling at all when enrichment
+        // isn't configured — see `enrich_worker`'s module docs.
+        None => None,
+    };
 
     // The requested IP (so a wildcard bind address, which a reconciling
     // client could not usefully connect back to, never ends up in the
@@ -251,6 +315,9 @@ async fn run(
     // committed.
     observer.shutdown();
     extract_worker.shutdown();
+    if let Some(enrich_worker) = enrich_worker {
+        enrich_worker.shutdown();
+    }
     pidfile::remove(&canonical_data_dir);
 
     tracing::info!("shut down cleanly");
@@ -956,5 +1023,42 @@ mod cli_tests {
         // ambiguous about which state was intended.
         let result = Cli::try_parse_from(["dafs", "--detach"]);
         assert!(result.is_err());
+    }
+
+    /// A base URL with no model to ask for is a configuration mistake, not a
+    /// state worth silently tolerating — see `Args::llm_base_url`'s own doc
+    /// comment on why this is `requires`, not a runtime no-op.
+    #[test]
+    fn llm_base_url_without_a_model_is_a_parse_error() {
+        let result = Cli::try_parse_from(["dafs", "--llm-base-url", "http://localhost:11434/v1"]);
+        assert!(result.is_err(), "a base url with no model must fail to parse");
+    }
+
+    #[test]
+    fn llm_model_without_a_base_url_is_a_parse_error() {
+        let result = Cli::try_parse_from(["dafs", "--llm-model", "llama3"]);
+        assert!(result.is_err(), "a model with no base url must fail to parse");
+    }
+
+    #[test]
+    fn llm_base_url_and_model_together_parse() {
+        let cli = Cli::try_parse_from([
+            "dafs",
+            "--llm-base-url",
+            "http://localhost:11434/v1",
+            "--llm-model",
+            "llama3",
+        ])
+        .expect("both together must parse");
+        assert_eq!(cli.args.llm_base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(cli.args.llm_model.as_deref(), Some("llama3"));
+    }
+
+    #[test]
+    fn llm_flags_are_absent_and_timeout_defaults_when_unset() {
+        let cli = Cli::try_parse_from(["dafs"]).expect("must parse");
+        assert!(cli.args.llm_base_url.is_none(), "enrichment must be opt-in, not default-on");
+        assert!(cli.args.llm_model.is_none());
+        assert_eq!(cli.args.llm_timeout_secs, 120);
     }
 }
