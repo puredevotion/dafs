@@ -46,7 +46,15 @@ themselves — including as test fixtures.
 [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope): …`,
 `fix(scope): …`, `docs: …`, etc.). Version bumps and `CHANGELOG.md` are generated from
 these by release-please — an inaccurate type or scope shows up in the next release's
-changelog, not just in `git log`.
+changelog, not just in `git log`. A commit it can't parse isn't rejected there, it's
+silently excluded from that decision — which is how `v0.0.1` shipped tagged by hand,
+with no changelog entry.
+
+Run `./scripts/install-hooks.sh` once per clone (or just `nix develop` — the devShell
+does it for you) to get a `commit-msg` hook that rejects a non-conforming subject
+locally, before it reaches CI. The `commit-lint` job in `ci.yml` / `ci/main.go` is the
+same check server-side, for anyone who commits with `--no-verify` or without the hook
+installed.
 
 ## Branches and merging
 
