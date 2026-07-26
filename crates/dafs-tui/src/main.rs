@@ -13,15 +13,23 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
+mod capabilities;
 mod client;
 mod ui;
 
+use capabilities::Capabilities;
 use client::Client;
+
+/// Samples of `dafs_resident_bytes` kept for the trend sparkline. At the
+/// default 1s refresh that's a 2-minute window — enough to see a scan spike
+/// and its decay without keeping unbounded history.
+const RSS_HISTORY_LEN: usize = 120;
 
 #[derive(Parser, Debug)]
 #[command(name = "dafs-tui", version, about = "Read-only status monitor for a dafs daemon")]
@@ -43,13 +51,18 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let client = Client::new(args.url.clone());
     let refresh = Duration::from_millis(args.refresh_ms.max(100));
+    let caps = Capabilities::detect();
 
     let mut terminal = ratatui::init();
     let mut status = client.poll(args.limit);
+    let mut rss_history: VecDeque<u64> = VecDeque::with_capacity(RSS_HISTORY_LEN);
+    push_rss_sample(&mut rss_history, &status);
     let mut last_poll = Instant::now();
 
     let result = loop {
-        if let Err(e) = terminal.draw(|frame| ui::draw(frame, &args.url, &status)) {
+        if let Err(e) =
+            terminal.draw(|frame| ui::draw(frame, &args.url, &status, &rss_history, caps))
+        {
             break Err(e.into());
         }
 
@@ -71,10 +84,22 @@ fn main() -> anyhow::Result<()> {
 
         if last_poll.elapsed() >= refresh {
             status = client.poll(args.limit);
+            push_rss_sample(&mut rss_history, &status);
             last_poll = Instant::now();
         }
     };
 
     ratatui::restore();
     result
+}
+
+/// Append the latest RSS sample, dropping the oldest once the window is full.
+/// A missed sample (daemon unreachable this tick) is skipped rather than
+/// recorded as zero, so a disconnect blank rather than a fake trough.
+fn push_rss_sample(history: &mut VecDeque<u64>, status: &client::Status) {
+    let Some(rss) = status.resident_bytes else { return };
+    if history.len() == RSS_HISTORY_LEN {
+        history.pop_front();
+    }
+    history.push_back(rss);
 }
