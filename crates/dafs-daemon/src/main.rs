@@ -130,11 +130,13 @@ struct Args {
     no_initial_scan: bool,
 
     /// Fork into the background and log to `<data-dir>/dafs.log` instead of
-    /// the terminal. Without this, a daemon started with `&` keeps writing
-    /// to whatever else shares that terminal — including, in practice, a
-    /// `dafs-tui` in the same window, whose alternate-screen rendering that
-    /// corrupts.
-    #[arg(long, env = "DAFS_DETACH")]
+    /// the terminal. On by default: a foreground daemon started with `&`
+    /// keeps writing to whatever else shares that terminal — including, in
+    /// practice, a `dafs-tui` in the same window, whose alternate-screen
+    /// rendering that corrupts. Pass `--detach false` to stay in the
+    /// foreground (debugging, or under a supervisor that already manages
+    /// the process and expects it not to fork).
+    #[arg(long, env = "DAFS_DETACH", default_value_t = true, action = clap::ArgAction::Set)]
     detach: bool,
 
     /// When `--watch` roots are given but a daemon is already running for
@@ -857,17 +859,33 @@ mod cli_tests {
     }
 
     #[test]
-    fn detach_and_on_running_default_off() {
+    fn detach_defaults_on_and_on_running_defaults_none() {
         let cli = Cli::try_parse_from(["dafs"]).expect("must parse");
-        assert!(!cli.args.detach);
+        assert!(cli.args.detach, "detach should default on — see the corruption it fixes");
         assert!(cli.args.on_running.is_none());
     }
 
     #[test]
-    fn detach_and_on_running_parse() {
-        let cli = Cli::try_parse_from(["dafs", "--detach", "--on-running", "replace"])
+    fn detach_false_opts_back_into_the_foreground() {
+        let cli = Cli::try_parse_from(["dafs", "--detach", "false"]).expect("must parse");
+        assert!(!cli.args.detach);
+    }
+
+    #[test]
+    fn detach_true_and_on_running_parse() {
+        let cli = Cli::try_parse_from(["dafs", "--detach", "true", "--on-running", "replace"])
             .expect("must parse");
         assert!(cli.args.detach);
         assert_eq!(cli.args.on_running, Some(OnRunning::Replace));
+    }
+
+    #[test]
+    fn detach_requires_an_explicit_value() {
+        // A bare `--detach` with no value must not silently mean "on" or
+        // "off" — the whole point of switching this to an explicit-value
+        // flag is that the default is already on, so a bare flag would be
+        // ambiguous about which state was intended.
+        let result = Cli::try_parse_from(["dafs", "--detach"]);
+        assert!(result.is_err());
     }
 }

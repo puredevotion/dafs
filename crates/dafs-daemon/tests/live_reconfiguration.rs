@@ -81,6 +81,11 @@ fn spawn_daemon(watch: &Path) -> RunningDaemon {
         .arg("127.0.0.1:0")
         .arg("--watch")
         .arg(watch)
+        // --detach defaults on now; this test's Child handle (and its
+        // Drop-based cleanup) needs to track the actual daemon process, not
+        // a parent that forks and exits immediately.
+        .arg("--detach")
+        .arg("false")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

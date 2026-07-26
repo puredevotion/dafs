@@ -142,13 +142,22 @@ before extracting anything, and installs to `~/.local/bin/dafs`
 
 ```sh
 cargo build --release -p dafs-daemon
-./target/release/dafs --watch ~/Documents    # observe a directory
+./target/release/dafs --watch ~/Documents    # observe a directory, in the background
 open http://127.0.0.1:7878                   # read the timeline
 ```
 
 With no `--watch` it starts, serves an empty timeline, and observes nothing —
 a daemon that began indexing a home directory nobody pointed it at would be a
 surprise.
+
+`dafs` detaches into the background by default, logging to
+`<data-dir>/dafs.log` instead of the terminal — a foreground daemon sharing a
+terminal with another tool (`dafs-tui`, say) would have its log output land
+in whatever that tool is rendering. Pass `--detach false` to stay in the
+foreground instead (debugging, or under a supervisor that already manages the
+process). Either way, `dafs stop [--data-dir ...]` stops it, and a second
+`dafs --watch X` against the same `--data-dir` reconfigures the running one
+(`--on-running=add|replace`) rather than failing to bind.
 
 The frontend lives in `ui/` and is built with Vite. Its output
 (`ui/dist/index.html`, one self-contained file) is **committed**, because the
