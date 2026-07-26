@@ -11,8 +11,12 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # Read version and name from Cargo.toml rather than duplicating them.
-        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        # Read the version from crates/dafs-daemon/Cargo.toml rather than
+        # duplicating it — that's the crate release-please tracks
+        # (release-please-config.json), and the one place a literal version
+        # is guaranteed current. Root Cargo.toml is a virtual workspace
+        # manifest with no [package] table at all.
+        cargoToml = builtins.fromTOML (builtins.readFile ./crates/dafs-daemon/Cargo.toml);
       in
       {
         packages = rec {
@@ -20,7 +24,7 @@
 
           dafs = pkgs.rustPlatform.buildRustPackage {
             pname = "dafs";
-            version = cargoToml.workspace.package.version;
+            version = cargoToml.package.version;
 
             # Filtered rather than `self` so an unrelated doc or CI edit does not
             # invalidate the derivation.
@@ -90,7 +94,7 @@
           # image never occupies store space twice.
           docker = pkgs.dockerTools.streamLayeredImage {
             name = "dafs";
-            tag = cargoToml.workspace.package.version;
+            tag = cargoToml.package.version;
             contents = [ dafs pkgs.cacert ];
             config = {
               Entrypoint = [ "${dafs}/bin/dafs" ];

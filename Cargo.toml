@@ -3,7 +3,10 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.3"
+# No `version` here: every member sets its own literal version (see
+# scripts/check-crate-versions.sh) because release-please's cargo-workspace
+# plugin needs one, and a workspace-level version nothing inherits from would
+# just go stale.
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
