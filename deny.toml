@@ -29,6 +29,14 @@ allow = [
   "CC0-1.0",
   "Unicode-3.0",
   "Zlib",
+  # Weak, file-level copyleft rather than GPL-style: it only obliges sharing
+  # modifications to files actually licensed under it, and this project never
+  # modifies or vendors uluru's source, only links against it unmodified.
+  # Added deliberately for `uluru`, pulled in unconditionally by gix-pack
+  # (M02a's git metadata extractor, crates/dafs-extract) for its packfile
+  # object cache — there is no gix feature flag that avoids gix-pack, since
+  # reading packed objects is not optional for a real repository.
+  "MPL-2.0",
 ]
 confidence-threshold = 0.9
 # `license-not-encountered` warnings for entries in this list are expected and

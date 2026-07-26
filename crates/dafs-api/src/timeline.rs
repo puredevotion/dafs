@@ -33,7 +33,13 @@ use serde::Serialize;
 ///
 /// A DTO rather than the store's own type: the wire format is a compatibility
 /// surface with the UI and should not change just because a column was renamed.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// The extraction fields are all omitted from the JSON when absent (`Option`
+/// plus `skip_serializing_if`, matching `size_bytes`/`previous_path` above)
+/// rather than serialized as `null` — most files have no metadata yet, and a
+/// client should be able to tell "no metadata" from "empty string" without
+/// special-casing null.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct TimelineItem {
     pub id: i64,
     pub path: String,
@@ -44,6 +50,30 @@ pub struct TimelineItem {
     pub is_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_taken_at_unix: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_camera_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head_author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head_at_unix: Option<i64>,
 }
 
 /// What the timeline handler needs from a store.
@@ -52,21 +82,38 @@ pub struct TimelineItem {
 /// into a 500 and a log line either way, and a richer type here would leak the
 /// store's error taxonomy into the API crate for no gain.
 pub trait TimelineStore: Send + Sync + 'static {
+    #[allow(clippy::too_many_arguments)]
     fn timeline(
         &self,
         limit: u32,
         before_id: Option<i64>,
         kind: Option<&str>,
+        doc_type: Option<&str>,
+        author: Option<&str>,
+        language: Option<&str>,
+        git_branch: Option<&str>,
     ) -> Result<Vec<TimelineItem>, String>;
 
-    /// Event and file counts, for `/metrics` and the UI header.
+    /// Event and file counts, plus the extraction queue depth, for `/metrics`
+    /// and the UI header.
     fn stats(&self) -> Result<TimelineStats, String>;
+
+    /// Distinct values (and counts) of one facet column, most common first —
+    /// what populates a `/facets`-backed filter dropdown. `field` is one of
+    /// `doc_type`/`author`/`language`/`git_branch`; validating that is the
+    /// caller's job (the HTTP handler), same division of labour `events`
+    /// already uses for `kind` — this trait method is not the place to 400.
+    fn facets(&self, field: &str) -> Result<Vec<(String, i64)>, String>;
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct TimelineStats {
     pub events: i64,
     pub files: i64,
+    /// Files still in `extraction_queue` (M02a) — a raw row count, not the
+    /// dispatcher's retry-eligible view. Zero for a store with no metadata
+    /// module wired in at all.
+    pub pending_extractions: i64,
 }
 
 /// A shared, type-erased [`TimelineStore`].
@@ -88,6 +135,10 @@ pub(crate) mod testing {
             limit: u32,
             before_id: Option<i64>,
             kind: Option<&str>,
+            doc_type: Option<&str>,
+            author: Option<&str>,
+            language: Option<&str>,
+            git_branch: Option<&str>,
         ) -> Result<Vec<TimelineItem>, String> {
             if self.fail {
                 return Err("store is broken".into());
@@ -97,6 +148,10 @@ pub(crate) mod testing {
                 .iter()
                 .filter(|i| before_id.is_none_or(|b| i.id < b))
                 .filter(|i| kind.is_none_or(|k| i.kind == k))
+                .filter(|i| doc_type.is_none_or(|d| i.doc_type.as_deref() == Some(d)))
+                .filter(|i| author.is_none_or(|a| i.author.as_deref() == Some(a)))
+                .filter(|i| language.is_none_or(|l| i.language.as_deref() == Some(l)))
+                .filter(|i| git_branch.is_none_or(|g| i.git_branch.as_deref() == Some(g)))
                 .take(limit as usize)
                 .cloned()
                 .collect())
@@ -106,7 +161,37 @@ pub(crate) mod testing {
             if self.fail {
                 return Err("store is broken".into());
             }
-            Ok(TimelineStats { events: self.items.len() as i64, files: self.items.len() as i64 })
+            Ok(TimelineStats {
+                events: self.items.len() as i64,
+                files: self.items.len() as i64,
+                // FakeStore has no extraction queue to model; every real test
+                // of the gauge itself goes through `SqliteTimeline`.
+                pending_extractions: 0,
+            })
+        }
+
+        fn facets(&self, field: &str) -> Result<Vec<(String, i64)>, String> {
+            if self.fail {
+                return Err("store is broken".into());
+            }
+            let value = |i: &TimelineItem| -> Option<String> {
+                match field {
+                    "doc_type" => i.doc_type.clone(),
+                    "author" => i.author.clone(),
+                    "language" => i.language.clone(),
+                    "git_branch" => i.git_branch.clone(),
+                    _ => None,
+                }
+            };
+            let mut counts: Vec<(String, i64)> = Vec::new();
+            for v in self.items.iter().filter_map(value) {
+                match counts.iter_mut().find(|(existing, _)| *existing == v) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((v, 1)),
+                }
+            }
+            counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            Ok(counts)
         }
     }
 }

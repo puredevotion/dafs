@@ -29,6 +29,12 @@ pub struct TimelineItem {
     pub size_bytes: Option<i64>,
     #[serde(default)]
     pub is_dir: bool,
+    /// Populated by M02a's deterministic extractor; absent from a daemon that
+    /// predates it. `#[serde(default)]` makes that omission decode as `None`
+    /// rather than a deserialize error, so this client keeps working against
+    /// both an old and a new daemon without a version check.
+    #[serde(default)]
+    pub doc_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,5 +222,26 @@ mod tests {
         let parsed = parse_prometheus("dafs_ready\ndafs_events_total 3\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed.get("dafs_events_total"), Some(&3.0));
+    }
+
+    #[test]
+    fn timeline_item_deserializes_a_doc_type_when_present() {
+        let item: TimelineItem = serde_json::from_str(
+            r#"{"id":1,"path":"/a.pdf","kind":"created","at_unix_ms":0,"doc_type":"pdf"}"#,
+        )
+        .expect("valid payload");
+        assert_eq!(item.doc_type.as_deref(), Some("pdf"));
+    }
+
+    #[test]
+    fn timeline_item_defaults_doc_type_to_none_on_todays_real_payload_shape() {
+        // Matches what the current daemon actually sends — no `doc_type` key
+        // at all, not `null` — this is the additive-safety case the field
+        // exists to guarantee.
+        let item: TimelineItem = serde_json::from_str(
+            r#"{"id":1,"path":"/a","kind":"created","at_unix_ms":0,"is_dir":true}"#,
+        )
+        .expect("payload without doc_type still deserializes");
+        assert_eq!(item.doc_type, None);
     }
 }

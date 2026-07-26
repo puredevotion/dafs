@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 dafs-store = { path = "../crates/dafs-store" }
+dafs-extract = { path = "../crates/dafs-extract" }
 tempfile = "3"
 
 # The fuzz crate is intentionally OUTSIDE the workspace: cargo-fuzz builds it
@@ -30,6 +31,38 @@ bench = false
 [[bin]]
 name = "paths"
 path = "fuzz_targets/paths.rs"
+test = false
+doc = false
+bench = false
+
+# M02's document extractors, per the testing bar
+# (docs/roadmap-and-design-review.md §5.2 item 3): every parser touching bytes
+# the user did not type gets a fuzz target. PDF is excluded — it goes through
+# a separate native pdfium worker, out of scope for this crate.
+[[bin]]
+name = "docx_extract"
+path = "fuzz_targets/docx_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xlsx_extract"
+path = "fuzz_targets/xlsx_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pptx_extract"
+path = "fuzz_targets/pptx_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exif_extract"
+path = "fuzz_targets/exif_extract.rs"
 test = false
 doc = false
 bench = false

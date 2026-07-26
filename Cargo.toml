@@ -30,7 +30,6 @@ axum = { version = "0.8", default-features = false, features = [
   "tokio",
   "query",
 ] }
-tower-http = { version = "0.6", default-features = false, features = ["trace"] }
 
 # Metadata store. rusqlite over sqlx: no async layer, no connection pool, and a
 # far smaller dependency tree. The store is local-file, single-process, and

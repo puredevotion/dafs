@@ -378,17 +378,23 @@ fn append_events(conn: &Connection, events: &[NewEvent]) -> Result<(), ScanError
 /// [`record_entry`] logic, so an event looks identical whether it came from a
 /// scan or a live change. A separate implementation here would be a second
 /// source of truth for "what counts as a modification", and the two would drift.
+///
+/// Returns the file's id when a non-directory file was actually created or
+/// modified — the signal the daemon's extraction queue is driven off of.
+/// Every other outcome (outside every watch root, vanished before it could be
+/// stat'd, a directory, an unchanged watch-fire) returns `None`: none of those
+/// are a file whose *content* extraction could ever care about.
 pub fn record_path(
     conn: &Connection,
     interner: &mut Interner,
     roots: &[PathBuf],
     path: &Path,
-) -> Result<(), ScanError> {
+) -> Result<Option<FileId>, ScanError> {
     let Some(root) = owning_root(roots, path) else {
         // A change outside every watch root. Not an error — notify can report
         // paths from a root that was just removed — but nothing to record.
         tracing::trace!(path = %path.display(), "change outside all watch roots, ignoring");
-        return Ok(());
+        return Ok(None);
     };
 
     // The file may already be gone again by the time this runs, which is normal
@@ -397,11 +403,12 @@ pub fn record_path(
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return record_removal(conn, interner, roots, path);
+            record_removal(conn, interner, roots, path)?;
+            return Ok(None);
         }
         Err(e) => {
             tracing::debug!(path = %path.display(), "cannot stat changed path: {e}");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -421,7 +428,7 @@ pub fn record_path(
     };
 
     let Some(name) = path.file_name() else {
-        return Ok(());
+        return Ok(None);
     };
     let name = name.to_string_lossy();
     let component_id = if is_dir {
@@ -434,7 +441,7 @@ pub fn record_path(
     let file_id = upsert_entry(conn, Some(parent_id), component_id, is_dir, size, mtime)?;
 
     if is_dir {
-        return Ok(());
+        return Ok(None);
     }
 
     let kind = match previous {
@@ -442,14 +449,14 @@ pub fn record_path(
         Some(prev) if prev.size_bytes != size || prev.mtime_unix != mtime => EventKind::Modified,
         Some(_) => {
             tracing::trace!(path = %path.display(), "watch fired but nothing changed");
-            return Ok(());
+            return Ok(None);
         }
     };
 
     dafs_store::events::append(conn, &NewEvent::now(file_id, kind).with_size(size))?;
     tracing::debug!(path = %path.display(), kind = kind.as_str(), "recorded watch event");
 
-    Ok(())
+    Ok(Some(file_id))
 }
 
 /// Record that a path moved.
@@ -462,17 +469,23 @@ pub fn record_path(
 /// Falls back to recording the destination as a plain change when the source
 /// was never known (a move in from outside the watched tree, or from a
 /// directory the scan skipped).
+///
+/// Returns the file's id whenever the destination is a file inside a watched
+/// root — same signal as [`record_path`], since a rename is as much a reason
+/// to (re-)extract as a create or a modify: the fallback and moved-out cases
+/// below delegate to functions that already return the right thing.
 pub fn record_rename(
     conn: &Connection,
     interner: &mut Interner,
     roots: &[PathBuf],
     from: &Path,
     to: &Path,
-) -> Result<(), ScanError> {
+) -> Result<Option<FileId>, ScanError> {
     let Some(to_root) = owning_root(roots, to) else {
         // Moved out of every watched tree: from this tree's point of view the
         // file is gone.
-        return record_removal(conn, interner, roots, from);
+        record_removal(conn, interner, roots, from)?;
+        return Ok(None);
     };
 
     // Resolve the source row without creating anything — a rename of something
@@ -496,7 +509,7 @@ pub fn record_rename(
     };
 
     let Some(name) = to.file_name() else {
-        return Ok(());
+        return Ok(None);
     };
     let name = name.to_string_lossy();
 
@@ -539,7 +552,10 @@ pub fn record_rename(
 
     tracing::debug!(from = %from.display(), to = %to.display(), "recorded rename");
 
-    Ok(())
+    // A renamed directory still needs the row update above (its children's
+    // paths resolve through it), but directories never need extraction — same
+    // rule `record_entry` applies to a plain create or modify.
+    Ok(if is_dir { None } else { Some(file_id) })
 }
 
 /// Find an existing `files` row for a path, without creating anything.
@@ -1237,5 +1253,101 @@ mod tests {
         let summary = scan(&conn, &mut i, dir.path(), &ScanOptions::default()).expect("scan");
         assert_eq!(summary.files_seen as usize, n);
         assert_eq!(count(&conn).expect("count") as usize, n, "the final partial batch was lost");
+    }
+
+    /// The signal `dafs-daemon` drives its extraction queue off: a genuinely
+    /// new file must hand back an id to enqueue.
+    #[test]
+    fn record_path_returns_the_file_id_for_a_new_file() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+        let path = write(dir.path(), "a.txt", "one");
+
+        let file_id =
+            record_path(&conn, &mut i, &roots, &path).expect("record path").expect("a new file");
+        assert!(
+            dafs_store::paths::resolve_path(&conn, file_id).expect("resolve").ends_with("/a.txt"),
+            "the id handed back was not the file just recorded"
+        );
+    }
+
+    /// A watch firing with nothing actually changed must not enqueue a
+    /// pointless re-extraction of an untouched file.
+    #[test]
+    fn record_path_returns_none_when_nothing_changed() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+        let path = write(dir.path(), "a.txt", "one");
+
+        record_path(&conn, &mut i, &roots, &path).expect("first").expect("created");
+        let second = record_path(&conn, &mut i, &roots, &path).expect("second");
+        assert_eq!(second, None, "an unchanged file should not be reported as changed");
+    }
+
+    /// Directories never need extraction — the same rule a scan already
+    /// applies to events applies here to the id handed back for enqueuing.
+    #[test]
+    fn record_path_returns_none_for_a_directory() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("mkdir");
+
+        let result = record_path(&conn, &mut i, &roots, &nested).expect("record path");
+        assert_eq!(result, None, "a directory should never be queued for extraction");
+    }
+
+    /// A change outside every watch root is a no-op, not a file to extract.
+    #[test]
+    fn record_path_returns_none_outside_every_root() {
+        let (conn, mut i, dir) = setup();
+        let watched = dir.path().join("watched");
+        std::fs::create_dir_all(&watched).expect("mkdir");
+        let roots = vec![watched];
+        let outside = write(dir.path(), "elsewhere.txt", "one");
+
+        let result = record_path(&conn, &mut i, &roots, &outside).expect("record path");
+        assert_eq!(result, None);
+    }
+
+    /// The rename counterpart of the above: a moved file is exactly as much a
+    /// reason to (re-)extract as a create or modify.
+    #[test]
+    fn record_rename_returns_the_file_id_for_a_renamed_file() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+
+        let before = write(dir.path(), "before.txt", "contents");
+        scan(&conn, &mut i, dir.path(), &ScanOptions::default()).expect("scan");
+
+        let after = dir.path().join("after.txt");
+        std::fs::rename(&before, &after).expect("rename");
+        let file_id = record_rename(&conn, &mut i, &roots, &before, &after)
+            .expect("record rename")
+            .expect("a renamed file");
+
+        assert!(
+            dafs_store::paths::resolve_path(&conn, file_id)
+                .expect("resolve")
+                .ends_with("/after.txt"),
+            "the id handed back was not the renamed file"
+        );
+    }
+
+    /// A renamed directory must still update its row (its children resolve
+    /// through it) but must not be queued for extraction.
+    #[test]
+    fn record_rename_returns_none_for_a_renamed_directory() {
+        let (conn, mut i, dir) = setup();
+        let roots = vec![dir.path().to_path_buf()];
+
+        let before = dir.path().join("before-dir");
+        std::fs::create_dir(&before).expect("mkdir");
+        scan(&conn, &mut i, dir.path(), &ScanOptions::default()).expect("scan");
+
+        let after = dir.path().join("after-dir");
+        std::fs::rename(&before, &after).expect("rename");
+        let result = record_rename(&conn, &mut i, &roots, &before, &after).expect("record rename");
+        assert_eq!(result, None, "a renamed directory should never be queued for extraction");
     }
 }

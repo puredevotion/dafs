@@ -15,6 +15,7 @@ use std::sync::Mutex;
 
 use dafs_api::{TimelineItem, TimelineStats, TimelineStore};
 use dafs_store::events::{EventKind, TimelineQuery};
+use dafs_store::metadata::{self, FacetColumn};
 use rusqlite::Connection;
 
 /// The shared metadata connection.
@@ -51,6 +52,10 @@ impl TimelineStore for SqliteTimeline {
         limit: u32,
         before_id: Option<i64>,
         kind: Option<&str>,
+        doc_type: Option<&str>,
+        author: Option<&str>,
+        language: Option<&str>,
+        git_branch: Option<&str>,
     ) -> Result<Vec<TimelineItem>, String> {
         // An unparseable kind reaching here would mean the handler's validation
         // was bypassed; treat it as no filter rather than inventing one, since
@@ -58,7 +63,15 @@ impl TimelineStore for SqliteTimeline {
         // that reads as "nothing happened".
         let kind = kind.and_then(EventKind::parse);
 
-        let query = TimelineQuery { limit: Some(limit), before_id, kind };
+        let query = TimelineQuery {
+            limit: Some(limit),
+            before_id,
+            kind,
+            doc_type: doc_type.map(String::from),
+            author: author.map(String::from),
+            language: language.map(String::from),
+            git_branch: git_branch.map(String::from),
+        };
 
         self.with_conn(|conn| {
             dafs_store::events::timeline(conn, &query)
@@ -71,10 +84,35 @@ impl TimelineStore for SqliteTimeline {
         self.with_conn(|conn| {
             let events = dafs_store::events::count(conn).map_err(|e| e.to_string())?;
             let files = dafs_store::events::file_count(conn).map_err(|e| e.to_string())?;
-            Ok(TimelineStats { events, files })
+            let pending_extractions = metadata::queue_depth(conn).map_err(|e| e.to_string())?;
+            Ok(TimelineStats { events, files, pending_extractions })
+        })
+    }
+
+    fn facets(&self, field: &str) -> Result<Vec<(String, i64)>, String> {
+        // The handler validates `field` against these same four names before
+        // calling here (see `dafs_api::lib`'s `/facets` route); an unrecognised
+        // name reaching this far is a bypassed check, not a query this store
+        // can answer, so it fails loudly rather than guessing a column.
+        let column = match field {
+            "doc_type" => FacetColumn::DocType,
+            "author" => FacetColumn::Author,
+            "language" => FacetColumn::Language,
+            "git_branch" => FacetColumn::GitBranch,
+            other => return Err(format!("unknown facet field: {other}")),
+        };
+
+        self.with_conn(|conn| {
+            metadata::distinct_facets(conn, column, MAX_FACET_VALUES).map_err(|e| e.to_string())
         })
     }
 }
+
+/// Cap on distinct facet values returned in one `/facets` response — bounds
+/// the reply the same way `events::MAX_LIMIT` bounds a timeline page, so a
+/// column with pathologically many distinct values cannot turn one request
+/// into an unbounded response.
+const MAX_FACET_VALUES: u32 = 50;
 
 fn to_dto(entry: dafs_store::events::TimelineEntry) -> TimelineItem {
     TimelineItem {
@@ -85,6 +123,18 @@ fn to_dto(entry: dafs_store::events::TimelineEntry) -> TimelineItem {
         size_bytes: entry.size_bytes,
         is_dir: entry.is_dir,
         previous_path: entry.previous_path,
+        doc_type: entry.doc_type,
+        title: entry.title,
+        author: entry.author,
+        language: entry.language,
+        page_count: entry.page_count,
+        word_count: entry.word_count,
+        image_taken_at_unix: entry.image_taken_at_unix,
+        image_camera_model: entry.image_camera_model,
+        git_branch: entry.git_branch,
+        git_head_commit: entry.git_head_commit,
+        git_head_author: entry.git_head_author,
+        git_head_at_unix: entry.git_head_at_unix,
     }
 }
 
@@ -112,7 +162,7 @@ mod tests {
     #[test]
     fn timeline_maps_store_rows_to_dtos() {
         let store = store_with_events();
-        let items = store.timeline(10, None, None).expect("timeline");
+        let items = store.timeline(10, None, None, None, None, None, None).expect("timeline");
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].kind, "modified", "most recent first");
@@ -122,7 +172,8 @@ mod tests {
     #[test]
     fn filtering_by_kind_reaches_the_store() {
         let store = store_with_events();
-        let items = store.timeline(10, None, Some("created")).expect("timeline");
+        let items =
+            store.timeline(10, None, Some("created"), None, None, None, None).expect("timeline");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "created");
@@ -132,8 +183,70 @@ mod tests {
     #[test]
     fn an_unparseable_kind_is_treated_as_no_filter() {
         let store = store_with_events();
-        let items = store.timeline(10, None, Some("exploded")).expect("timeline");
+        let items =
+            store.timeline(10, None, Some("exploded"), None, None, None, None).expect("timeline");
         assert_eq!(items.len(), 2, "an unknown kind silently emptied the timeline");
+    }
+
+    #[test]
+    fn filtering_by_doc_type_reaches_the_store() {
+        let store = store_with_events();
+        let file = dafs_store::paths::ensure_dir_chain(
+            &store.conn.lock().expect("lock"),
+            &mut Interner::new(),
+            Path::new("/home/u/a.txt"),
+        )
+        .expect("same file id");
+        metadata::record_extraction(
+            &store.conn.lock().expect("lock"),
+            file,
+            &metadata::FileMetadata {
+                doc_type: Some("text".into()),
+                extracted_at_unix: 1_000,
+                extractor_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record extraction");
+
+        let items =
+            store.timeline(10, None, None, Some("text"), None, None, None).expect("timeline");
+        assert_eq!(items.len(), 2, "both events are for the same extracted file");
+        assert!(items.iter().all(|i| i.doc_type.as_deref() == Some("text")));
+
+        let none = store.timeline(10, None, None, Some("pdf"), None, None, None).expect("timeline");
+        assert!(none.is_empty(), "a non-matching doc_type should exclude every row");
+    }
+
+    #[test]
+    fn facets_returns_distinct_values_from_file_metadata() {
+        let store = store_with_events();
+        let file = dafs_store::paths::ensure_dir_chain(
+            &store.conn.lock().expect("lock"),
+            &mut Interner::new(),
+            Path::new("/home/u/a.txt"),
+        )
+        .expect("same file id");
+        metadata::record_extraction(
+            &store.conn.lock().expect("lock"),
+            file,
+            &metadata::FileMetadata {
+                doc_type: Some("text".into()),
+                extracted_at_unix: 1_000,
+                extractor_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record extraction");
+
+        let values = store.facets("doc_type").expect("facets");
+        assert_eq!(values, vec![("text".to_string(), 1)]);
+    }
+
+    #[test]
+    fn facets_rejects_an_unknown_field() {
+        let store = store_with_events();
+        assert!(store.facets("nonsense").is_err());
     }
 
     #[test]
@@ -141,6 +254,22 @@ mod tests {
         let store = store_with_events();
         let stats = store.stats().expect("stats");
         assert_eq!(stats.events, 2);
+    }
+
+    #[test]
+    fn stats_reports_the_extraction_queue_depth() {
+        let store = store_with_events();
+        assert_eq!(store.stats().expect("stats").pending_extractions, 0);
+
+        let file = dafs_store::paths::ensure_dir_chain(
+            &store.conn.lock().expect("lock"),
+            &mut Interner::new(),
+            Path::new("/home/u/a.txt"),
+        )
+        .expect("same file id");
+        metadata::enqueue(&store.conn.lock().expect("lock"), file, 1_000).expect("enqueue");
+
+        assert_eq!(store.stats().expect("stats").pending_extractions, 1);
     }
 
     /// A poisoned mutex must not permanently break the daemon.
@@ -156,7 +285,9 @@ mod tests {
         .join();
 
         // The next query must still work.
-        let items = store.timeline(10, None, None).expect("timeline after poisoning");
+        let items = store
+            .timeline(10, None, None, None, None, None, None)
+            .expect("timeline after poisoning");
         assert_eq!(items.len(), 2);
     }
 }

@@ -35,6 +35,7 @@ use clap::Parser;
 
 mod control_client;
 mod detach;
+mod extract_worker;
 mod pidfile;
 mod store_adapter;
 mod watch_adapter;
@@ -229,6 +230,7 @@ async fn run(
     tracing::info!(schema_version, roots = ?args.watch, "ready");
 
     let observer = spawn_observer(&args, &db_path, shared_roots, command_rx)?;
+    let extract_worker = extract_worker::spawn(&db_path).context("spawning extraction worker")?;
 
     // The requested IP (so a wildcard bind address, which a reconciling
     // client could not usefully connect back to, never ends up in the
@@ -248,6 +250,7 @@ async fn run(
     // must not stop the daemon from exiting, and every event it had is already
     // committed.
     observer.shutdown();
+    extract_worker.shutdown();
     pidfile::remove(&canonical_data_dir);
 
     tracing::info!("shut down cleanly");
@@ -468,6 +471,18 @@ fn observe(
         }
     }
 
+    // One O(total files) pass, exactly once at startup — never per watch
+    // event, which is what `apply_change`'s own `enqueue` calls are for
+    // instead. Covers both a normal first run (nothing extracted yet) and a
+    // `--no-initial-scan` restart against an already-populated store: either
+    // way, whatever the current extractor version has not yet seen belongs in
+    // the queue before the watch loop starts.
+    if let Err(e) =
+        dafs_store::metadata::requeue_stale(&conn, dafs_extract::EXTRACTOR_VERSION, now_unix())
+    {
+        tracing::error!("could not requeue stale extractions: {e}");
+    }
+
     let mut watch = match dafs_scan::watch::Watch::new(&initial_roots) {
         Ok(w) => w,
         Err(e) => {
@@ -615,7 +630,9 @@ fn apply_change(
             tracing::trace!(path = %path.display(), "ignoring excluded path");
         }
         Change::Touched(path) => {
-            dafs_scan::record_path(conn, interner, roots, &path)?;
+            if let Some(file_id) = dafs_scan::record_path(conn, interner, roots, &path)? {
+                enqueue_for_extraction(conn, file_id);
+            }
         }
         Change::Removed(path) => {
             dafs_scan::record_removal(conn, interner, roots, &path)?;
@@ -631,16 +648,51 @@ fn apply_change(
                 (true, true) => {
                     tracing::trace!("ignoring rename entirely within excluded paths");
                 }
-                (true, false) => dafs_scan::record_path(conn, interner, roots, &to)?,
+                (true, false) => {
+                    if let Some(file_id) = dafs_scan::record_path(conn, interner, roots, &to)? {
+                        enqueue_for_extraction(conn, file_id);
+                    }
+                }
                 (false, true) => dafs_scan::record_removal(conn, interner, roots, &from)?,
                 (false, false) => {
-                    dafs_scan::record_rename(conn, interner, roots, &from, &to)?;
+                    if let Some(file_id) =
+                        dafs_scan::record_rename(conn, interner, roots, &from, &to)?
+                    {
+                        enqueue_for_extraction(conn, file_id);
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Queue one file for (re-)extraction. The O(1)-per-event counterpart to
+/// `observe`'s startup-only `requeue_stale`: this is what keeps a live-watched
+/// corpus's extraction queue current without ever re-scanning the whole
+/// `files` table on every touch, which would be the wrong complexity class at
+/// a million-file corpus (see `docs/memory-budget.md`).
+///
+/// Logged rather than propagated: a file the scan just recorded successfully
+/// should not fail the whole watch-change handler because its queue entry
+/// could not be written — the file is still correctly in `files`, and a later
+/// `requeue_stale` on the next restart would pick it up regardless.
+fn enqueue_for_extraction(conn: &rusqlite::Connection, file_id: dafs_store::paths::FileId) {
+    if let Err(e) = dafs_store::metadata::enqueue(conn, file_id, now_unix()) {
+        tracing::warn!(file_id, "could not enqueue a file for extraction: {e}");
+    }
+}
+
+/// Seconds since the epoch, for the metadata store's `_unix` (not `_ms`)
+/// fields — `dafs_store::events::now_unix_ms` is the wrong unit for
+/// `requeue_stale`/`enqueue`/`record_extraction`, which all store seconds.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        // A clock before the epoch is not worth failing a queue write over.
+        .unwrap_or(0)
 }
 
 /// The installer script, embedded at compile time.

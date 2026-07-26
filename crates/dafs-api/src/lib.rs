@@ -180,6 +180,9 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/metrics", get(metrics))
         .route("/events", get(events))
+        // Distinct facet values for a metadata column, for building filter
+        // dropdowns without pulling full history — see `metadata::distinct_facets`.
+        .route("/facets", get(facets))
         // GET reads the level, PUT changes it. See `logging` for why a write
         // endpoint is acceptable on an unauthenticated API bound to loopback,
         // and what has to change if that bind ever widens.
@@ -207,7 +210,20 @@ struct EventsQuery {
     limit: Option<u32>,
     before_id: Option<i64>,
     kind: Option<String>,
+    doc_type: Option<String>,
+    author: Option<String>,
+    language: Option<String>,
+    git_branch: Option<String>,
 }
+
+/// Cap on any single facet-filter query-string value.
+///
+/// The M01 DAST pass found `/log-level` would buffer an unbounded body; the
+/// same shape of bug exists here in a different place — a query string has no
+/// body-size limit to catch it, so each facet field gets its own cap. 256
+/// bytes is far above any real `author`/`language`/branch name and far below
+/// anything that matters for a denial-of-service budget.
+const MAX_FACET_FILTER_LEN: usize = 256;
 
 /// The timeline.
 async fn events(
@@ -233,6 +249,15 @@ async fn events(
             .into_response();
     }
 
+    for field in
+        [&query.doc_type, &query.author, &query.language, &query.git_branch].into_iter().flatten()
+    {
+        if field.len() > MAX_FACET_FILTER_LEN {
+            return (StatusCode::BAD_REQUEST, Json(ApiError { error: "facet filter too long" }))
+                .into_response();
+        }
+    }
+
     // spawn_blocking because the store takes a mutex around a synchronous
     // SQLite call. Awaiting that inline would stall the single-threaded runtime
     // — including the health probes — for the length of the query.
@@ -241,6 +266,10 @@ async fn events(
             query.limit.unwrap_or(DEFAULT_EVENT_LIMIT),
             query.before_id,
             query.kind.as_deref(),
+            query.doc_type.as_deref(),
+            query.author.as_deref(),
+            query.language.as_deref(),
+            query.git_branch.as_deref(),
         )
     })
     .await;
@@ -278,6 +307,69 @@ struct EventsResponse {
     /// empty, which is how a client knows it has reached the end.
     #[serde(skip_serializing_if = "Option::is_none")]
     next_before_id: Option<i64>,
+}
+
+/// Query parameters for `/facets`.
+#[derive(Debug, Deserialize)]
+struct FacetsQuery {
+    field: String,
+}
+
+/// One distinct facet value and how many timeline rows carry it.
+///
+/// A named struct rather than a `(String, i64)` tuple: a tuple serializes as a
+/// bare JSON array (`["pdf",3]`), which forces every client to remember
+/// positional meaning instead of reading a key.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct FacetEntry {
+    value: String,
+    count: i64,
+}
+
+/// Distinct values of one metadata facet, most common first — what a filter
+/// dropdown is built from without pulling full history.
+async fn facets(
+    State(state): State<AppState>,
+    Query(query): Query<FacetsQuery>,
+) -> impl IntoResponse {
+    let Some(reader) = state.timeline().cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "timeline store not attached" }),
+        )
+            .into_response();
+    };
+
+    // Validate before touching the store, same reasoning as `kind` on
+    // `/events`: an unrecognised field is the caller's error, not an empty
+    // result that reads as "this facet has no values".
+    if !matches!(query.field.as_str(), "doc_type" | "author" | "language" | "git_branch") {
+        return (StatusCode::BAD_REQUEST, Json(ApiError { error: "unknown facet field" }))
+            .into_response();
+    }
+
+    // spawn_blocking for the same reason every other store-touching handler
+    // here uses it: the mutex-guarded SQLite call must not run on the async
+    // runtime's thread.
+    let result = tokio::task::spawn_blocking(move || reader.facets(&query.field)).await;
+
+    match result {
+        Ok(Ok(values)) => {
+            let entries: Vec<FacetEntry> =
+                values.into_iter().map(|(value, count)| FacetEntry { value, count }).collect();
+            (StatusCode::OK, Json(entries)).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("facets query failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "facets query failed" }))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("facets task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "facets task failed" }))
+                .into_response()
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -527,6 +619,18 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 out.push_str("# HELP dafs_files_known Files currently known, excluding deleted.\n");
                 out.push_str("# TYPE dafs_files_known gauge\n");
                 out.push_str(&format!("dafs_files_known {}\n", stats.files));
+
+                // M02a: lets a deployment (and dafs-memtest's queue-drain
+                // scenario) observe the extraction queue draining instead of
+                // guessing from a fixed sleep.
+                out.push_str(
+                    "# HELP dafs_extraction_queue_depth Files waiting for metadata extraction.\n",
+                );
+                out.push_str("# TYPE dafs_extraction_queue_depth gauge\n");
+                out.push_str(&format!(
+                    "dafs_extraction_queue_depth {}\n",
+                    stats.pending_extractions
+                ));
             }
             Err(e) => {
                 // A failed stat must not fail the scrape: the RSS and readiness
@@ -679,6 +783,7 @@ mod tests {
                 size_bytes: Some(id * 10),
                 is_dir: false,
                 previous_path: None,
+                ..Default::default()
             })
             .collect();
 
@@ -746,6 +851,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_facet_filter_on_events_is_rejected() {
+        let (status, body) =
+            get(router(state_with_events(3)), &format!("/events?doc_type={}", "a".repeat(300)))
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an oversized facet filter should be rejected, not silently truncated: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn facets_returns_data_from_the_store_for_a_known_field() {
+        let (status, body) = get(router(state_with_events(3)), "/facets?field=doc_type").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]", "the fake store has no doc_type values: {body}");
+    }
+
+    #[tokio::test]
+    async fn facets_rejects_an_unknown_field() {
+        let (status, body) = get(router(state_with_events(3)), "/facets?field=nonsense").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    }
+
+    #[tokio::test]
+    async fn facets_without_a_store_is_503() {
+        let (status, _) = get(router(AppState::new(1)), "/facets?field=doc_type").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn a_store_failure_is_a_500_not_a_panic() {
         let state = AppState::new(1)
             .with_timeline(Arc::new(timeline::testing::FakeStore { items: vec![], fail: true }));
@@ -760,6 +896,10 @@ mod tests {
 
         assert!(body.contains("dafs_events_total 7"), "event count missing: {body}");
         assert!(body.contains("dafs_files_known"), "file gauge missing: {body}");
+        assert!(
+            body.contains("dafs_extraction_queue_depth"),
+            "extraction queue gauge missing: {body}"
+        );
     }
 
     /// A failing store must not break the scrape — RSS and readiness are exactly
