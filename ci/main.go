@@ -28,10 +28,19 @@
 //	dagger call ui-bundle      --source=..     # rebuild the UI, diff vs committed
 //	dagger call dast           --source=..     # scanners against a live daemon
 //	dagger call image          --source=..     # OCI container
+//	dagger call build          --source=.. --target=x86_64-unknown-linux-gnu  # release tarball + sha256
+//	dagger call sbom           --source=..     # CycloneDX SBOM per crate
 //
 // `image` returns a Container rather than pushing it. Pushing needs credentials
 // that are specific to whoever is deploying — this module stays credential-free
 // so it can run anywhere, and the push is the caller's step.
+//
+// `build` and `sbom` mirror the `build`/`sbom` jobs in release.yml: same target
+// matrix, same strip-then-package steps, same cargo-cyclonedx invocation. They
+// exist here so a release artifact is reproducible on any machine with Dagger,
+// not only inside GitHub Actions — the same reason the rest of this module
+// exists. `publish` (cutting the GitHub Release itself) stays GitHub-only: it is
+// the one step that is genuinely tied to that forge.
 package main
 
 import (
@@ -321,6 +330,72 @@ func (m *DafsCi) Image(source *dagger.Directory) *dagger.Container {
 		WithEnvVariable("DAFS_DATA_DIR", "/data").
 		WithExposedPort(7878).
 		WithEntrypoint([]string{"/dafs"})
+}
+
+// releaseTargets maps a Rust target triple to the asset name release.yml
+// publishes it under. Kept in lockstep with the `build` job's matrix there —
+// a target added to one belongs in the other.
+var releaseTargets = map[string]string{
+	"x86_64-unknown-linux-gnu":  "dafs-x86_64-linux",
+	"aarch64-unknown-linux-gnu": "dafs-aarch64-linux",
+}
+
+// Build cross-compiles the release daemon for `target`, strips it, and
+// packages it exactly as release.yml's `build` job does: a `.tar.gz` plus a
+// detached `.tar.gz.sha256`, both returned in the output directory.
+//
+// Stripping happens here rather than via the release profile, for the same
+// reason release.yml does it in packaging: cargo applies profile-level
+// `strip` to build-script and proc-macro binaries too, and stripping those is
+// a route to obscure build failures. Doing it here affects only the artifact
+// actually shipped.
+func (m *DafsCi) Build(ctx context.Context, source *dagger.Directory, target string) (*dagger.Directory, error) {
+	name, ok := releaseTargets[target]
+	if !ok {
+		return nil, fmt.Errorf("unsupported target %q (known: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu)", target)
+	}
+
+	container := m.rustBase(source, rustImage).
+		WithExec([]string{"rustup", "target", "add", target})
+
+	stripBin := "strip"
+	if target == "aarch64-unknown-linux-gnu" {
+		// jemalloc and bundled SQLite are C, so cross-compiling needs a cross
+		// linker and compiler too, not just a Rust target — same as release.yml.
+		container = container.
+			WithExec([]string{"apt-get", "update"}).
+			WithExec([]string{"apt-get", "install", "-y", "gcc-aarch64-linux-gnu"}).
+			WithEnvVariable("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", "aarch64-linux-gnu-gcc").
+			WithEnvVariable("CC_aarch64_unknown_linux_gnu", "aarch64-linux-gnu-gcc")
+		stripBin = "aarch64-linux-gnu-strip"
+	}
+
+	container = container.WithExec([]string{"cargo", "build", "--release", "-p", "dafs-daemon", "--target", target})
+
+	binPath := fmt.Sprintf("/src/target/%s/release/dafs", target)
+	script := fmt.Sprintf(`set -e
+%s %s
+mkdir -p /out
+tar -czf /out/%s.tar.gz -C "$(dirname %s)" dafs
+sha256sum /out/%s.tar.gz > /out/%s.tar.gz.sha256
+`, stripBin, binPath, name, binPath, name, name)
+
+	container = container.WithExec([]string{"sh", "-c", script})
+	return container.Directory("/out"), nil
+}
+
+// Sbom generates a CycloneDX SBOM for every crate in the workspace, mirroring
+// release.yml's `sbom` job.
+func (m *DafsCi) Sbom(ctx context.Context, source *dagger.Directory) *dagger.Directory {
+	script := `set -e
+cargo cyclonedx --format json --all
+mkdir -p /out
+find . -name '*.cdx.json' -not -path './target/*' -exec cp {} /out/ \;
+`
+	container := m.rustBase(source, rustImage).
+		WithExec([]string{"cargo", "install", "cargo-cyclonedx", "--locked"}).
+		WithExec([]string{"sh", "-c", script})
+	return container.Directory("/out")
 }
 
 // Check runs the whole suite concurrently and reports a per-check verdict.
