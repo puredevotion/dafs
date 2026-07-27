@@ -28,9 +28,12 @@
 10020	IGNORE	Loopback-only UI; framing yields nothing the viewer cannot already see
 
 # X-Content-Type-Options. Every response sets an explicit Content-Type, so
-# sniffing has nothing to guess at. Cheap to add regardless — tracked, not
-# ignored.
-10021	WARN	Explicit Content-Type on every route; worth adding the header anyway
+# sniffing has nothing to guess at. Fixed rather than left as a tracked WARN:
+# dafs_api::set_security_headers sets `nosniff` on every response via a
+# router-level layer, so this alert should no longer fire at all. Left as
+# WARN, not IGNORE, so a regression (a route added outside the layer) is
+# still visible instead of silently swallowed.
+10021	WARN	Fixed — nosniff set globally by dafs_api::set_security_headers; WARN kept as a regression tripwire, not because this is expected to fire
 
 # HTTPS-related alerts. The API is plain HTTP on loopback deliberately: TLS to
 # 127.0.0.1 protects against nothing and would require a certificate the daemon
