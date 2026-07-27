@@ -1,0 +1,53 @@
+#!/bin/sh
+# Scans commits about to be pushed for hardcoded secrets with gitleaks.
+#
+# Local half of the same pairing every other hook in this directory uses:
+# a fast check here, before anything leaves this machine, and a CI job
+# (`gitleaks` in ci.yml / ci/main.go) as the backstop for `--no-verify`, a
+# clone without hooks installed, or a machine without gitleaks on PATH.
+#
+# POSIX sh, no bashisms, to match scripts/install.sh's portability discipline.
+
+set -eu
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  cat >&2 <<EOF
+[pre-push] gitleaks not found on PATH — skipping local secret scan.
+Install it (https://github.com/gitleaks/gitleaks#installing) to catch this
+before it reaches the remote; ci.yml's gitleaks job is the real backstop
+either way.
+EOF
+  exit 0
+fi
+
+remote_name="$1"
+zero="0000000000000000000000000000000000000000"
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue # deleting a ref: nothing to scan
+
+  if [ "$remote_sha" != "$zero" ]; then
+    # Updating an existing ref: scan exactly what's new.
+    range="$remote_sha..$local_sha"
+  elif base=$(git merge-base "$local_sha" "refs/remotes/$remote_name/main" 2>/dev/null); then
+    # New ref, but a main to diff against: scan what main doesn't have yet.
+    range="$base..$local_sha"
+  else
+    # New ref and no main to compare against (e.g. pushing to a remote with
+    # no main yet) — fall back to the ref's full history.
+    range="$local_sha"
+  fi
+
+  if ! gitleaks git --log-opts="$range" --redact --no-banner .; then
+    echo "[pre-push] gitleaks found a likely secret in $local_ref ($range) — see above" >&2
+    status=1
+  fi
+done
+
+if [ "$status" -ne 0 ]; then
+  echo "[pre-push] rejected: gitleaks found something. Fix it, or if it's a false" >&2
+  echo "positive add a .gitleaksignore entry (see gitleaks docs) and re-push." >&2
+fi
+
+exit "$status"

@@ -56,6 +56,12 @@ locally, before it reaches CI. The `commit-lint` job in `ci.yml` / `ci/main.go` 
 same check server-side, for anyone who commits with `--no-verify` or without the hook
 installed.
 
+The same install also gets you a `pre-push` hook that scans what you're about to push
+with [gitleaks](https://github.com/gitleaks/gitleaks) — it needs `gitleaks` on `PATH`
+(installed but missing, it warns and skips rather than blocking the push). The
+`gitleaks` job in `ci.yml` / `ci/main.go` is the same scan server-side, for the same
+`--no-verify` / no-hooks-installed reasons as `commit-lint`.
+
 ## Branches and merging
 
 `main` takes no direct pushes — every change lands through a pull request.
