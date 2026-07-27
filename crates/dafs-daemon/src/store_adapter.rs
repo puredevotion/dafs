@@ -11,12 +11,14 @@
 //! never held across an await point — the `Mutex` here is `std`'s, deliberately,
 //! because an async mutex would invite exactly that mistake.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
-use dafs_api::{TimelineItem, TimelineStats, TimelineStore};
+use dafs_api::{SearchFilters, SearchHit, SearchStore, TimelineItem, TimelineStats, TimelineStore};
 use dafs_store::enrichment::{self, FacetColumn as EnrichmentFacetColumn};
-use dafs_store::events::{EventKind, TimelineQuery};
+use dafs_store::events::{EventKind, TimelineEntry, TimelineQuery};
 use dafs_store::metadata::{self, FacetColumn};
+use dafs_store::paths::FileId;
 use rusqlite::Connection;
 
 /// The shared metadata connection.
@@ -125,6 +127,134 @@ impl TimelineStore for SqliteTimeline {
             metadata::distinct_facets(conn, column, MAX_FACET_VALUES).map_err(|e| e.to_string())
         })
     }
+}
+
+/// Bridges the SQLite store and `dafs_enrich::embed` to the API's
+/// [`SearchStore`] trait — see `dafs_api::search`'s own module docs for why
+/// this is a separate trait/adapter from [`SqliteTimeline`] rather than a
+/// method grafted onto it.
+///
+/// A connection of its own, not a share of `SqliteTimeline`'s: same WAL
+/// reasoning as every other dedicated connection in this daemon (see
+/// `main.rs`'s and `enrich_worker.rs`'s module docs) — a search embeds its
+/// query text over the network before ever touching SQLite, and that network
+/// call must not sit behind (or hold up) an unrelated timeline request's
+/// lock for as long as it takes.
+pub struct SqliteSearch {
+    conn: Mutex<Connection>,
+    config: dafs_enrich::Config,
+}
+
+impl SqliteSearch {
+    /// `config` is the whole `dafs_enrich::Config`, not just its
+    /// `embedding` field — `dafs_enrich::embed` needs `base_url`/`api_key`/
+    /// `timeout` too, same as `embed_worker` — but callers should only
+    /// construct this when `config.embedding.is_some()` (mirroring
+    /// `embed_worker::spawn`'s own contract), since a search against an
+    /// unconfigured embedding model can never do anything useful.
+    pub fn new(conn: Connection, config: dafs_enrich::Config) -> Self {
+        Self { conn: Mutex::new(conn), config }
+    }
+
+    /// Mirrors `SqliteTimeline::with_conn` exactly, including the
+    /// poisoned-lock recovery.
+    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        match self.conn.lock() {
+            Ok(guard) => f(&guard),
+            Err(poisoned) => {
+                tracing::warn!("search connection mutex was poisoned; recovering");
+                f(&poisoned.into_inner())
+            }
+        }
+    }
+}
+
+impl SearchStore for SqliteSearch {
+    fn search(
+        &self,
+        query: &str,
+        limit: u32,
+        filters: &SearchFilters,
+    ) -> Result<Vec<SearchHit>, String> {
+        // Deliberately outside `with_conn`: this is a blocking network call,
+        // and holding the connection's mutex across it would stall every
+        // other search (and, if this were sharing `SqliteTimeline`'s
+        // connection, every timeline request too) for as long as the
+        // embedding endpoint takes to answer.
+        let vector = dafs_enrich::embed(query, &self.config).map_err(|e| e.to_string())?;
+
+        // `dafs_store::embeddings::search` has no way to filter *before*
+        // ranking — a vec0 query only ever knows about the embedding column,
+        // never `file_metadata`/`file_enrichment` — so a filtered search
+        // pulls a larger candidate pool and filters/truncates afterwards.
+        // See `SearchStore::search`'s own docs on why this can return fewer
+        // than `limit` hits rather than over-fetching indefinitely to
+        // guarantee an exact count.
+        let candidate_limit = if filters.is_empty() {
+            limit
+        } else {
+            limit.saturating_mul(FACET_FILTER_OVERSAMPLE).min(MAX_FACET_CANDIDATE_LIMIT)
+        };
+
+        self.with_conn(|conn| {
+            let hits = dafs_store::embeddings::search(conn, &vector, candidate_limit)
+                .map_err(|e| e.to_string())?;
+            let distance_by_file: HashMap<FileId, f64> = hits.iter().copied().collect();
+            let file_ids: Vec<FileId> = hits.into_iter().map(|(id, _)| id).collect();
+
+            let entries = dafs_store::events::latest_for_file_ids(conn, &file_ids)
+                .map_err(|e| e.to_string())?;
+
+            Ok(entries
+                .into_iter()
+                // `latest_for_file_ids` preserves `file_ids`' order — the
+                // vector search's own ranking — so filtering here keeps
+                // whatever order survives it, rather than needing a re-sort.
+                .filter(|entry| entry_matches_filters(entry, filters))
+                .take(limit as usize)
+                .map(|entry| {
+                    // Present for every entry `latest_for_file_ids` returned:
+                    // it was only ever asked about `file_ids`, drawn from
+                    // this same `distance_by_file`'s keys.
+                    let distance = distance_by_file
+                        .get(&entry.file_id)
+                        .copied()
+                        .expect("every returned entry's file_id came from hits above");
+                    SearchHit { distance, item: to_dto(entry) }
+                })
+                .collect())
+        })
+    }
+}
+
+/// How many candidates a filtered search pulls from the vector search per
+/// requested result, on top of (not instead of)
+/// `dafs_store::embeddings::search`'s own internal Hamming/rescore
+/// oversampling — a second, independent layer of oversampling because a
+/// facet filter can exclude an arbitrary fraction of the corpus, which the
+/// vector-distance oversample factor knows nothing about.
+const FACET_FILTER_OVERSAMPLE: u32 = 5;
+
+/// Hard ceiling on the candidate pool a filtered search ever requests,
+/// regardless of `limit` — bounds the cost of a restrictive filter against a
+/// large `limit` the same way `MAX_FACET_VALUES` bounds `/facets`, rather
+/// than letting `limit * FACET_FILTER_OVERSAMPLE` grow without one.
+const MAX_FACET_CANDIDATE_LIMIT: u32 = 500;
+
+/// Whether `entry` passes every set filter — exact match, same "absent
+/// means excluded" rule `dafs_store::events::TimelineQuery`'s own facet
+/// filters use, applied here in Rust rather than SQL because
+/// `dafs_store::embeddings::search` already returned the ranked candidates
+/// by the time this runs.
+fn entry_matches_filters(entry: &TimelineEntry, filters: &SearchFilters) -> bool {
+    let matches = |filter: &Option<String>, field: &Option<String>| {
+        filter.as_deref().is_none_or(|f| field.as_deref() == Some(f))
+    };
+    matches(&filters.doc_type, &entry.doc_type)
+        && matches(&filters.author, &entry.author)
+        && matches(&filters.language, &entry.language)
+        && matches(&filters.git_branch, &entry.git_branch)
+        && matches(&filters.classification, &entry.classification)
 }
 
 /// Cap on distinct facet values returned in one `/facets` response — bounds
@@ -373,5 +503,150 @@ mod tests {
             .timeline(10, None, None, None, None, None, None, None)
             .expect("timeline after poisoning");
         assert_eq!(items.len(), 2);
+    }
+
+    /// A minimal HTTP/1.1 server answering one request with a canned
+    /// embeddings-endpoint body — mirrors `embed_worker`'s own
+    /// `spawn_mock_embedding_server`.
+    fn spawn_mock_embedding_server(vector: Vec<f32>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut buf = [0u8; 4096];
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            let _ = stream.read(&mut buf);
+
+            let numbers: Vec<String> = vector.iter().map(|f| f.to_string()).collect();
+            let body = format!(r#"{{"data":[{{"embedding":[{}]}}]}}"#, numbers.join(","));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    /// The end-to-end property `SqliteSearch` exists for: embed the query
+    /// against a (fake) endpoint, find the nearest stored vector, and join it
+    /// back to that file's own latest timeline row.
+    #[test]
+    fn search_embeds_the_query_and_returns_the_nearest_file() {
+        let conn = dafs_store::open_in_memory().expect("open");
+        let mut interner = Interner::new();
+        let a = ensure_dir_chain(&conn, &mut interner, Path::new("/home/u/a.txt")).expect("a");
+        let b = ensure_dir_chain(&conn, &mut interner, Path::new("/home/u/b.txt")).expect("b");
+        append(&conn, &NewEvent::now(a, StoreKind::Created).at(1_000)).expect("append a");
+        append(&conn, &NewEvent::now(b, StoreKind::Created).at(2_000)).expect("append b");
+
+        dafs_store::embeddings::ensure_table(&conn, "test-model", 3).expect("ensure_table");
+        dafs_store::embeddings::store(&conn, a, &[1.0, 0.0, 0.0]).expect("store a");
+        dafs_store::embeddings::store(&conn, b, &[0.0, 1.0, 0.0]).expect("store b");
+
+        let (base_url, server) = spawn_mock_embedding_server(vec![0.9, 0.1, 0.0]);
+        let config = dafs_enrich::Config {
+            base_url,
+            api_key: None,
+            model: "chat-model".to_string(),
+            timeout: std::time::Duration::from_secs(5),
+            embedding: Some(dafs_enrich::EmbeddingConfig {
+                model: "test-model".to_string(),
+                dimensions: 3,
+            }),
+        };
+
+        let search = SqliteSearch::new(conn, config);
+        let hits = search.search("looks like a", 10, &SearchFilters::default()).expect("search");
+        server.join().expect("mock server thread");
+
+        assert_eq!(hits.first().map(|h| h.item.path.as_str()), Some("/home/u/a.txt"));
+        assert!(
+            hits.first().map(|h| h.distance).unwrap_or(f64::MAX) < 1.0,
+            "the nearest hit should have a small distance: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn search_surfaces_embed_s_own_error_when_unconfigured() {
+        let conn = dafs_store::open_in_memory().expect("open");
+        let config = dafs_enrich::Config {
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: None,
+            model: "chat-model".to_string(),
+            timeout: std::time::Duration::from_millis(50),
+            embedding: None,
+        };
+
+        let search = SqliteSearch::new(conn, config);
+        assert!(search.search("anything", 10, &SearchFilters::default()).is_err());
+    }
+
+    /// The property `entry_matches_filters` exists for: a facet filter
+    /// excludes a candidate whose own metadata doesn't match it, even though
+    /// the vector search itself ranked it first.
+    #[test]
+    fn search_applies_facet_filters_to_vector_search_candidates() {
+        let conn = dafs_store::open_in_memory().expect("open");
+        let mut interner = Interner::new();
+        let a = ensure_dir_chain(&conn, &mut interner, Path::new("/home/u/a.docx")).expect("a");
+        let b = ensure_dir_chain(&conn, &mut interner, Path::new("/home/u/b.pdf")).expect("b");
+        append(&conn, &NewEvent::now(a, StoreKind::Created).at(1_000)).expect("append a");
+        append(&conn, &NewEvent::now(b, StoreKind::Created).at(2_000)).expect("append b");
+        metadata::record_extraction(
+            &conn,
+            a,
+            &metadata::FileMetadata {
+                doc_type: Some("docx".into()),
+                extracted_at_unix: 1_000,
+                extractor_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record a");
+        metadata::record_extraction(
+            &conn,
+            b,
+            &metadata::FileMetadata {
+                doc_type: Some("pdf".into()),
+                extracted_at_unix: 1_000,
+                extractor_version: 1,
+                ..Default::default()
+            },
+        )
+        .expect("record b");
+
+        dafs_store::embeddings::ensure_table(&conn, "test-model", 3).expect("ensure_table");
+        // `a` is the nearer vector — an unfiltered search would rank it
+        // first — but the filter below asks for `doc_type=pdf`, which only
+        // `b` has.
+        dafs_store::embeddings::store(&conn, a, &[1.0, 0.0, 0.0]).expect("store a");
+        dafs_store::embeddings::store(&conn, b, &[0.0, 1.0, 0.0]).expect("store b");
+
+        let (base_url, server) = spawn_mock_embedding_server(vec![0.9, 0.1, 0.0]);
+        let config = dafs_enrich::Config {
+            base_url,
+            api_key: None,
+            model: "chat-model".to_string(),
+            timeout: std::time::Duration::from_secs(5),
+            embedding: Some(dafs_enrich::EmbeddingConfig {
+                model: "test-model".to_string(),
+                dimensions: 3,
+            }),
+        };
+
+        let search = SqliteSearch::new(conn, config);
+        let filters = SearchFilters { doc_type: Some("pdf".to_string()), ..Default::default() };
+        let hits = search.search("looks like a", 10, &filters).expect("search");
+        server.join().expect("mock server thread");
+
+        assert_eq!(hits.len(), 1, "the docx hit should have been filtered out: {hits:?}");
+        assert_eq!(hits[0].item.path, "/home/u/b.pdf");
     }
 }

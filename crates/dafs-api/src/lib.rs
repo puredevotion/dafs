@@ -29,11 +29,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod log_history;
 mod logging;
+pub mod search;
 pub mod timeline;
 pub mod watch_control;
 
 pub use log_history::LogHistory;
 pub use logging::LogLevelHandle;
+pub use search::{SearchFilters, SearchHit, SearchReader, SearchStore};
 pub use timeline::{TimelineItem, TimelineReader, TimelineStats, TimelineStore};
 pub use watch_control::{WatchControl, WatchControlHandle, WatchMode};
 
@@ -71,6 +73,12 @@ struct StateInner {
     /// Set when the daemon installs a second tracing sink capturing recent
     /// output. `None` in unit tests of routes that do not touch it.
     log_history: Option<LogHistory>,
+    /// Set once the daemon wires in an embedding-backed search store — only
+    /// when M03 embeddings are actually configured (see
+    /// `search`'s own module docs on why this is independent of
+    /// `timeline`, not a method on the same trait). `None` whenever
+    /// embeddings aren't configured, which is the common case today.
+    search: Option<SearchReader>,
 }
 
 impl AppState {
@@ -84,6 +92,7 @@ impl AppState {
                 log_level: None,
                 watch_control: None,
                 log_history: None,
+                search: None,
             }),
         }
     }
@@ -113,6 +122,14 @@ impl AppState {
         self
     }
 
+    /// Attach the search store. Only called when M03 embeddings are actually
+    /// configured — see `search`'s own module docs, and `AppState::search`'s
+    /// doc comment on what `None` here means to `/search`.
+    pub fn with_search(mut self, reader: SearchReader) -> Self {
+        Self::inner_mut(&mut self).search = Some(reader);
+        self
+    }
+
     /// Mutable access during construction.
     ///
     /// Sound because the builders above run before any clone exists, so the
@@ -138,6 +155,10 @@ impl AppState {
 
     pub fn log_history(&self) -> Option<&LogHistory> {
         self.inner.log_history.as_ref()
+    }
+
+    pub fn search(&self) -> Option<&SearchReader> {
+        self.inner.search.as_ref()
     }
 
     /// Mark the daemon ready to serve. Called once startup work finishes.
@@ -184,6 +205,9 @@ pub fn router(state: AppState) -> Router {
         // Distinct facet values for a metadata column, for building filter
         // dropdowns without pulling full history — see `metadata::distinct_facets`.
         .route("/facets", get(facets))
+        // M03 semantic search — 503 when embeddings aren't configured, same
+        // shape as every other optionally-attached route on this router.
+        .route("/search", get(search_route))
         // GET reads the level, PUT changes it. See `logging` for why a write
         // endpoint is acceptable on an unauthenticated API bound to loopback,
         // and what has to change if that bind ever widens.
@@ -393,6 +417,103 @@ async fn facets(
         Err(e) => {
             tracing::error!("facets task panicked: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "facets task failed" }))
+                .into_response()
+        }
+    }
+}
+
+/// Query parameters for `/search`. The five facet fields mirror `/events`'
+/// own query parameters exactly — same names, same "exact match, absent
+/// means no filter" semantics — see `search::SearchFilters`'s own docs.
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+    limit: Option<u32>,
+    doc_type: Option<String>,
+    author: Option<String>,
+    language: Option<String>,
+    git_branch: Option<String>,
+    classification: Option<String>,
+}
+
+/// Default page size when the caller does not ask for one, mirroring
+/// `/events`'s `DEFAULT_EVENT_LIMIT`.
+const DEFAULT_SEARCH_LIMIT: u32 = 20;
+
+/// Cap on `q`'s length. Generous against any real query — `dafs_enrich`'s own
+/// `MAX_INPUT_CHARS` (8,000) is what the embedding call itself truncates
+/// to — but a query string has no body-size limit the way a JSON body does
+/// (see `MAX_FACET_FILTER_LEN`'s own comment on the M01 DAST finding this
+/// mirrors), so this bounds it before it ever reaches an embedding call.
+const MAX_SEARCH_QUERY_LEN: usize = 4096;
+
+#[derive(Serialize)]
+struct SearchResponse {
+    hits: Vec<search::SearchHit>,
+}
+
+async fn search_route(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let Some(reader) = state.search().cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "search not configured" }),
+        )
+            .into_response();
+    };
+
+    if query.q.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiError { error: "q must not be empty" }))
+            .into_response();
+    }
+    if query.q.len() > MAX_SEARCH_QUERY_LEN {
+        return (StatusCode::BAD_REQUEST, Json(ApiError { error: "q is too long" }))
+            .into_response();
+    }
+
+    // Same oversized-filter guard as `/events`, and for the same reason
+    // (see `MAX_FACET_FILTER_LEN`'s own comment): a query string has no
+    // body-size limit to catch an unbounded value the way a JSON body does.
+    for field in
+        [&query.doc_type, &query.author, &query.language, &query.git_branch, &query.classification]
+            .into_iter()
+            .flatten()
+    {
+        if field.len() > MAX_FACET_FILTER_LEN {
+            return (StatusCode::BAD_REQUEST, Json(ApiError { error: "facet filter too long" }))
+                .into_response();
+        }
+    }
+
+    let filters = search::SearchFilters {
+        doc_type: query.doc_type,
+        author: query.author,
+        language: query.language,
+        git_branch: query.git_branch,
+        classification: query.classification,
+    };
+
+    // spawn_blocking for the same reason every other store-touching handler
+    // here uses it — except here the blocking work includes a real network
+    // round trip to the configured embedding endpoint, not just a SQLite
+    // query, which makes staying off the single-threaded runtime even more
+    // important than usual.
+    let limit = query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let result =
+        tokio::task::spawn_blocking(move || reader.search(&query.q, limit, &filters)).await;
+
+    match result {
+        Ok(Ok(hits)) => (StatusCode::OK, Json(SearchResponse { hits })).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("search query failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "search query failed" }))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("search task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "search task failed" }))
                 .into_response()
         }
     }
@@ -954,6 +1075,111 @@ mod tests {
 
         let (status, _) = get(router(state), "/events").await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn sample_hit(id: i64, distance: f64) -> search::SearchHit {
+        search::SearchHit {
+            distance,
+            item: timeline::TimelineItem {
+                id,
+                path: format!("/home/u/file-{id}.txt"),
+                kind: "created".to_string(),
+                at_unix_ms: 1_000 + id,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn search_without_a_store_is_503_not_an_empty_list() {
+        // Same reasoning as `/events` without a timeline store: "no results"
+        // and "this daemon cannot answer" are different claims, and a client
+        // needs to be able to tell them apart.
+        let (status, _) = get(router(AppState::new(1)), "/search?q=budget").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn search_returns_hits_from_the_store() {
+        let state = AppState::new(1).with_search(Arc::new(search::testing::FakeSearchStore {
+            hits: vec![sample_hit(1, 0.1), sample_hit(2, 0.5)],
+            fail: false,
+        }));
+        let (status, body) = get(router(state), "/search?q=budget").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("file-1.txt"), "unexpected body: {body}");
+        assert!(body.contains("\"distance\":0.1"), "unexpected body: {body}");
+    }
+
+    #[tokio::test]
+    async fn search_respects_a_limit() {
+        let state = AppState::new(1).with_search(Arc::new(search::testing::FakeSearchStore {
+            hits: vec![sample_hit(1, 0.1), sample_hit(2, 0.2), sample_hit(3, 0.3)],
+            fail: false,
+        }));
+        let (status, body) = get(router(state), "/search?q=budget&limit=1").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("file-1.txt"));
+        assert!(!body.contains("file-2.txt"), "the limit should have dropped later hits: {body}");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_an_empty_query() {
+        let state = AppState::new(1)
+            .with_search(Arc::new(search::testing::FakeSearchStore { hits: vec![], fail: false }));
+        let (status, _) = get(router(state), "/search?q=").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_an_oversized_query() {
+        let state = AppState::new(1)
+            .with_search(Arc::new(search::testing::FakeSearchStore { hits: vec![], fail: false }));
+        let (status, _) =
+            get(router(state), &format!("/search?q={}", "a".repeat(MAX_SEARCH_QUERY_LEN + 1)))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_search_store_failure_is_a_500_not_a_panic() {
+        let state = AppState::new(1)
+            .with_search(Arc::new(search::testing::FakeSearchStore { hits: vec![], fail: true }));
+        let (status, _) = get(router(state), "/search?q=budget").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn search_facet_filters_reach_the_store() {
+        let mut docx_hit = sample_hit(1, 0.1);
+        docx_hit.item.doc_type = Some("docx".to_string());
+        let mut pdf_hit = sample_hit(2, 0.2);
+        pdf_hit.item.doc_type = Some("pdf".to_string());
+
+        let state = AppState::new(1).with_search(Arc::new(search::testing::FakeSearchStore {
+            hits: vec![docx_hit, pdf_hit],
+            fail: false,
+        }));
+
+        let (status, body) = get(router(state), "/search?q=budget&doc_type=pdf").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("file-2.txt"), "unexpected body: {body}");
+        assert!(!body.contains("file-1.txt"), "the doc_type filter should exclude it: {body}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_search_facet_filter_is_rejected() {
+        let state = AppState::new(1)
+            .with_search(Arc::new(search::testing::FakeSearchStore { hits: vec![], fail: false }));
+        let (status, body) =
+            get(router(state), &format!("/search?q=budget&author={}", "a".repeat(300))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an oversized facet filter should be rejected, not silently truncated: {body}"
+        );
     }
 
     #[tokio::test]

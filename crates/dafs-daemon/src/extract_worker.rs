@@ -125,11 +125,18 @@ impl ExtractWorker {
 /// worker just polls an empty table harmlessly until there is work.
 ///
 /// `enrichment_enabled` is whether the daemon was given an LLM endpoint at
-/// all (`main.rs`'s `llm_config.is_some()`) — threaded through as a bare
-/// `bool` rather than importing `dafs_enrich::Config` here, since this
-/// module otherwise has no reason to know anything about LLM configuration;
-/// it only needs to know whether to enqueue, not how enrichment itself works.
-pub fn spawn(db_path: &std::path::Path, enrichment_enabled: bool) -> anyhow::Result<ExtractWorker> {
+/// all (`main.rs`'s `llm_config.is_some()`), and `embedding_enabled` whether
+/// it was additionally given an embedding model (`main.rs`'s
+/// `embedding_enabled`, from `llm_config.embedding.is_some()`) — both
+/// threaded through as bare `bool`s rather than importing
+/// `dafs_enrich::Config` here, since this module otherwise has no reason to
+/// know anything about LLM configuration; it only needs to know whether to
+/// enqueue, not how enrichment or embedding themselves work.
+pub fn spawn(
+    db_path: &std::path::Path,
+    enrichment_enabled: bool,
+    embedding_enabled: bool,
+) -> anyhow::Result<ExtractWorker> {
     use anyhow::Context as _;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -139,7 +146,9 @@ pub fn spawn(db_path: &std::path::Path, enrichment_enabled: bool) -> anyhow::Res
 
     let handle = std::thread::Builder::new()
         .name("dafs-extract".into())
-        .spawn(move || run(&db_path, &thread_stop, &pdf_worker_bin, enrichment_enabled))
+        .spawn(move || {
+            run(&db_path, &thread_stop, &pdf_worker_bin, enrichment_enabled, embedding_enabled)
+        })
         .context("spawning the extraction worker thread")?;
 
     Ok(ExtractWorker { stop, handle: Some(handle) })
@@ -172,6 +181,7 @@ fn run(
     stop: &AtomicBool,
     pdf_worker_bin: &Path,
     enrichment_enabled: bool,
+    embedding_enabled: bool,
 ) {
     let conn = match dafs_store::open(db_path) {
         Ok(c) => c,
@@ -200,7 +210,7 @@ fn run(
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            process_one(&conn, file_id, pdf_worker_bin, enrichment_enabled);
+            process_one(&conn, file_id, pdf_worker_bin, enrichment_enabled, embedding_enabled);
         }
     }
 }
@@ -213,6 +223,7 @@ fn process_one(
     file_id: FileId,
     pdf_worker_bin: &Path,
     enrichment_enabled: bool,
+    embedding_enabled: bool,
 ) {
     // Recorded before any work happens at all — see the module docs on why
     // this ordering, not "after extraction fails", is what crash-consistency
@@ -248,10 +259,13 @@ fn process_one(
             let metadata = to_file_metadata(extraction);
             match dafs_store::metadata::record_extraction(conn, file_id, &metadata) {
                 // Also what makes a re-extracted file (modified, or an
-                // extractor-version bump) get re-enriched: it comes back
-                // through this same success path every time, not just on
-                // first extraction.
-                Ok(()) => maybe_enqueue_enrichment(conn, file_id, &metadata, enrichment_enabled),
+                // extractor-version bump) get re-enriched/re-embedded: it
+                // comes back through this same success path every time, not
+                // just on first extraction.
+                Ok(()) => {
+                    maybe_enqueue_enrichment(conn, file_id, &metadata, enrichment_enabled);
+                    maybe_enqueue_embedding(conn, file_id, &metadata, embedding_enabled);
+                }
                 Err(e) => {
                     tracing::warn!(
                         file_id,
@@ -485,6 +499,27 @@ fn maybe_enqueue_enrichment(
     }
 }
 
+/// After a successful extraction, enqueue the file for embedding if
+/// embeddings are configured at all and there is enough text to be worth a
+/// network round trip. Mirrors [`maybe_enqueue_enrichment`] exactly,
+/// including reusing [`has_enough_text_to_enrich`]'s floor — a file too
+/// short to be worth summarizing is equally not worth embedding, and
+/// inventing a second, separately-justified threshold here would be a
+/// distinction without a difference.
+fn maybe_enqueue_embedding(
+    conn: &Connection,
+    file_id: FileId,
+    metadata: &FileMetadata,
+    embedding_enabled: bool,
+) {
+    if !embedding_enabled || !has_enough_text_to_enrich(metadata) {
+        return;
+    }
+    if let Err(e) = dafs_store::embeddings::enqueue(conn, file_id, crate::now_unix()) {
+        tracing::warn!(file_id, "could not enqueue a file for embedding: {e}");
+    }
+}
+
 /// Field-for-field except for `doc_type` (needs its stored string form) and
 /// the two bookkeeping fields the store tracks that extraction itself has no
 /// opinion on.
@@ -546,7 +581,7 @@ mod tests {
         // false and this path is never spawned.
         let no_pdf_worker = Path::new("/nonexistent/dafs-pdf-worker");
         for file_id in dafs_store::metadata::pending(&conn, BATCH).expect("pending") {
-            process_one(&conn, file_id, no_pdf_worker, false);
+            process_one(&conn, file_id, no_pdf_worker, false, false);
         }
 
         assert!(dafs_store::metadata::pending(&conn, BATCH).expect("pending").is_empty());
@@ -574,7 +609,7 @@ mod tests {
 
         // Must not panic, and must not leave the queue entry silently gone —
         // the attempt is recorded but the row stays for the next retry.
-        process_one(&conn, file_id, Path::new("/nonexistent/dafs-pdf-worker"), false);
+        process_one(&conn, file_id, Path::new("/nonexistent/dafs-pdf-worker"), false, false);
 
         assert!(
             dafs_store::metadata::get(&conn, file_id).expect("get").is_none(),
@@ -643,6 +678,34 @@ mod tests {
             dafs_store::enrichment::pending(&conn, 10).expect("pending"),
             vec![file_id],
             "long text with enrichment enabled must be enqueued"
+        );
+    }
+
+    #[test]
+    fn maybe_enqueue_embedding_only_enqueues_when_enabled_and_long_enough() {
+        let conn = dafs_store::open_in_memory().expect("open");
+        let mut i = Interner::new();
+        let file_id = ensure_dir_chain(&conn, &mut i, Path::new("/a/report.docx")).expect("id");
+        let long = FileMetadata { body_text: Some("x".repeat(500)), ..Default::default() };
+        let short = FileMetadata { body_text: Some("short".into()), ..Default::default() };
+
+        maybe_enqueue_embedding(&conn, file_id, &short, true);
+        assert!(
+            dafs_store::embeddings::pending(&conn, 10).expect("pending").is_empty(),
+            "short text must not be enqueued even when embedding is enabled"
+        );
+
+        maybe_enqueue_embedding(&conn, file_id, &long, false);
+        assert!(
+            dafs_store::embeddings::pending(&conn, 10).expect("pending").is_empty(),
+            "long text must not be enqueued when embedding is disabled"
+        );
+
+        maybe_enqueue_embedding(&conn, file_id, &long, true);
+        assert_eq!(
+            dafs_store::embeddings::pending(&conn, 10).expect("pending"),
+            vec![file_id],
+            "long text with embedding enabled must be enqueued"
         );
     }
 
