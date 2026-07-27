@@ -94,16 +94,28 @@ const (
 // DafsCi is the CI module root.
 type DafsCi struct{}
 
-// rustBase returns a Rust container with the source mounted and cargo's caches
-// wired to Dagger cache volumes, so repeated local runs do not recompile the
-// world. The volumes are shared across invocations on the same engine.
+// rustBase returns a Rust container with the source copied in and cargo's
+// caches wired to Dagger cache volumes, so repeated local runs do not
+// recompile the world. The volumes are shared across invocations on the same
+// engine.
+//
+// WithDirectory (copy), not WithMountedDirectory (bind mount), for `source`:
+// per BuildKit's own documented behavior (dagger/dagger#6421, still open), a
+// mounted directory only gets content-hash cache validation when it is BOTH
+// a non-root mount AND read-only. A plain writable WithMountedDirectory —
+// what every call site in this file used before — skips that check entirely
+// and can legally reuse a cached downstream layer even when the mounted
+// content actually changed. WithDirectory copies the content into the
+// container's own filesystem layer instead, which is always content-addressed
+// like any other layer, with no such carve-out. Every other WithMountedDirectory
+// call in this file has the same fix for the same reason.
 func (m *DafsCi) rustBase(source *dagger.Directory, image string) *dagger.Container {
 	return dag.Container().
 		From(image).
 		WithMountedCache("/usr/local/cargo/registry", dag.CacheVolume("dafs-cargo-registry")).
 		WithMountedCache("/usr/local/cargo/git", dag.CacheVolume("dafs-cargo-git")).
 		WithMountedCache("/src/target", dag.CacheVolume("dafs-cargo-target")).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		// Match the GitHub workflow: warnings fail. Kept out of the source so
 		// local iteration is not painful.
@@ -142,7 +154,7 @@ echo "all commit subjects are Conventional Commits"`, pattern, base)
 	return dag.Container().
 		From("alpine:3.21").
 		WithExec([]string{"apk", "add", "--no-cache", "git", "bash"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"bash", "-c", script}).
 		Stdout(ctx)
@@ -160,7 +172,7 @@ func (m *DafsCi) CargoVersions(ctx context.Context, source *dagger.Directory) (s
 	return dag.Container().
 		From("alpine:3.21").
 		WithExec([]string{"apk", "add", "--no-cache", "gawk", "grep"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "scripts/check-crate-versions.sh"}).
 		Stdout(ctx)
@@ -292,7 +304,7 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 
 	return dag.Container().
 		From("alpine:3.21").
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
@@ -311,7 +323,7 @@ func (m *DafsCi) Gitleaks(ctx context.Context, source *dagger.Directory, base st
 
 	return dag.Container().
 		From(gitleaksImage).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"gitleaks", "git", "--log-opts=" + base + "..HEAD", "--redact", "--no-banner", "."}).
 		Stdout(ctx)
@@ -402,7 +414,7 @@ echo "committed bundle matches a fresh build, and is a single file"`
 		From(nodeImage).
 		// git is needed for the diff below and is not in the base node image.
 		WithExec([]string{"apk", "add", "--no-cache", "git"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
@@ -524,7 +536,7 @@ exit "$status"
 `
 	return dag.Container().
 		From("alpine:3.21").
-		WithMountedDirectory("/sbom", sbomDir).
+		WithDirectory("/sbom", sbomDir).
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
 }
@@ -545,7 +557,7 @@ exit "$status"
 func (m *DafsCi) GolangciLint(ctx context.Context) (string, error) {
 	return dag.Container().
 		From(golangciLintImage).
-		WithMountedDirectory("/src", dag.CurrentModule().Source()).
+		WithDirectory("/src", dag.CurrentModule().Source()).
 		WithWorkdir("/src").
 		WithExec([]string{"golangci-lint", "run", "--timeout=5m"}).
 		Stdout(ctx)
@@ -561,7 +573,7 @@ func (m *DafsCi) YamlLint(ctx context.Context, source *dagger.Directory) (string
 		// carries, for the same reproducibility reason every other tool
 		// here is pinned to a specific release.
 		WithExec([]string{"pip", "install", "--no-cache-dir", "--break-system-packages", "yamllint==1.38.0"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"yamllint", "-c", ".yamllint.yml", ".github/workflows"}).
 		Stdout(ctx)
@@ -578,7 +590,7 @@ func (m *DafsCi) NixLint(ctx context.Context, source *dagger.Directory) (string,
 	const nixpkgsRev = "e2587caef70cea85dd97d7daab492899902dbf5d"
 	return dag.Container().
 		From(nixToolsImage).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithEnvVariable("NIX_CONFIG", "experimental-features = nix-command flakes").
 		WithExec([]string{"nix", "run", "github:NixOS/nixpkgs/" + nixpkgsRev + "#statix", "--", "check", "."}).
@@ -608,8 +620,8 @@ func (m *DafsCi) OpengrepScan(ctx context.Context, source *dagger.Directory) (st
 		WithEnvVariable("PYTHONUTF8", "1").
 		WithEnvVariable("LC_ALL", "C.UTF-8").
 		WithFile("/usr/local/bin/opengrep", bin, dagger.ContainerWithFileOpts{Permissions: 0o755}).
-		WithMountedDirectory("/rules", rules).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/rules", rules).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"opengrep", "scan", "-f", "/rules/rust", "-f", "/rules/generic",
 			"--severity", "WARNING", "--severity", "ERROR", "--error", "."}).
