@@ -1,0 +1,62 @@
+# Nightly re-scan: catches a new advisory or SAST finding against code
+# nobody has touched recently, rather than waiting for the next push or the
+# weekly cron already on ci.yml (which exists to catch push-adjacent drift,
+# not to close this gap — see that workflow's own schedule comment).
+#
+# Also the sole writer of this repo's grype DB cache (see ci.yml's
+# `sbom-scan` job): deliberately a GH Actions cache, not homelab's in-cluster
+# NFS-cached one — this is a public repo on GH-hosted runners, so any
+# external fork's PR CI has to stay credential/cluster-access-free. Same
+# refresh cadence as homelab's cache, not the same physical store.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  refresh-grype-db:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin v0.116.0
+      - name: Refresh DB
+        run: |
+          mkdir -p ~/.cache/grype/db
+          GRYPE_DB_CACHE_DIR=~/.cache/grype/db grype db update
+          GRYPE_DB_CACHE_DIR=~/.cache/grype/db grype db status
+      - name: Save under today's date-keyed cache entry
+        id: date
+        run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/grype/db
+          key: grype-db-${{ steps.date.outputs.today }}
+
+  check:
+    # Runs the whole Dagger `check` suite (fmt, lint, test, hermetic,
+    # rss-ceiling, audit, private-refs, gitleaks, ui-bundle, dast,
+    # golangci-lint, yaml-lint, nix-lint, opengrep-scan, sbom-scan, and fuzz)
+    # with an extended fuzz campaign — 900s instead of the push-time 30s,
+    # long enough to matter without holding up anyone's PR, since nothing
+    # here blocks a merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Dagger CLI
+        run: curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR=/usr/local/bin sh
+      - name: Run the full check suite with an extended fuzz campaign
+        working-directory: ci
+        run: dagger --silent call check --source=.. --fuzz-seconds=900

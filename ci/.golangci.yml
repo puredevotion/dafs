@@ -1,0 +1,14 @@
+version: "2"
+
+# Scope: this module's own Go source (the Dagger CI module), not the Rust
+# workspace it drives. Deliberately narrow linter set — govet/staticcheck/
+# errcheck for correctness, gosec for the Go-side SAST gap this file exists
+# to close — rather than golangci-lint's full "all" bundle, which would flag
+# a lot of stylistic noise unrelated to why this config exists.
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gosec
