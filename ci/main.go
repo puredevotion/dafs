@@ -26,11 +26,13 @@
 //	dagger call audit          --source=..
 //	dagger call fuzz           --source=.. --seconds=60
 //	dagger call private-refs   --source=..
+//	dagger call gitleaks       --source=.. --base=main  # secret scan since base
 //	dagger call ui-bundle      --source=..     # rebuild the UI, diff vs committed
 //	dagger call dast           --source=..     # scanners against a live daemon
 //	dagger call image          --source=..     # OCI container
 //	dagger call build          --source=.. --target=x86_64-unknown-linux-gnu  # release tarball + sha256
 //	dagger call sbom           --source=..     # CycloneDX SBOM per crate
+//	dagger call sbom-scan      --source=..     # SBOM above, scanned for CVEs with grype
 //
 // `image` returns a Container rather than pushing it. Pushing needs credentials
 // that are specific to whoever is deploying — this module stays credential-free
@@ -60,13 +62,19 @@ const (
 	// Frontend builds only. Node appears nowhere in the daemon's own build —
 	// the UI bundle is committed, so `cargo build` and `nix build` need no
 	// JavaScript toolchain at all. See UiBundle.
-	nodeImage = "node:22-alpine"
+	nodeImage = "node:24-alpine"
 	// Dynamic scanning. ZAP's baseline is driven from the GitHub workflow,
 	// which has a maintained action for it; nuclei runs in both places.
-	nucleiImage = "projectdiscovery/nuclei:latest"
+	// Pinned to a real release, not :latest, for the same reproducibility
+	// reason every other image here is pinned.
+	nucleiImage = "projectdiscovery/nuclei:v3.11.0"
 	// Distroless: no shell, no package manager, and it carries CA certificates,
 	// which the daemon will need once it talks to peers.
 	runtimeImage = "gcr.io/distroless/cc-debian12:nonroot"
+	// Backstop for .githooks/pre-push. Pinned to the same version the GitHub
+	// workflow's gitleaks job installs directly, so a finding here or there
+	// is a version-drift bug, not two different scanners disagreeing.
+	gitleaksImage = "ghcr.io/gitleaks/gitleaks:v8.30.1"
 )
 
 // DafsCi is the CI module root.
@@ -276,6 +284,25 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 		Stdout(ctx)
 }
 
+// Gitleaks scans `base..HEAD` for hardcoded secrets.
+//
+// Backstop for .githooks/pre-push, the same pairing CommitLint is to the
+// commit-msg hook. `base` defaults to "main" if empty — same convention as
+// CommitLint, for the same reason: a local `dagger call` has no PR context to
+// read a base ref from, unlike the GitHub workflow's `gitleaks` job.
+func (m *DafsCi) Gitleaks(ctx context.Context, source *dagger.Directory, base string) (string, error) {
+	if base == "" {
+		base = "main"
+	}
+
+	return dag.Container().
+		From(gitleaksImage).
+		WithMountedDirectory("/src", source).
+		WithWorkdir("/src").
+		WithExec([]string{"gitleaks", "git", "--log-opts=" + base + "..HEAD", "--redact", "--no-banner", "."}).
+		Stdout(ctx)
+}
+
 // Dast runs dynamic scanners against a live daemon.
 //
 // Scoped to milestones that actually have an HTTP surface — three in the whole
@@ -309,6 +336,13 @@ func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, er
 
 	return dag.Container().
 		From(nucleiImage).
+		// Nuclei's template repo is ~100MB and is re-cloned on every fresh
+		// container otherwise. A persistent cache volume (shared across
+		// Dagger invocations on the same engine, same idea as the cargo
+		// caches in rustBase) turns every run after the first into a no-op
+		// fetch instead of a full clone — this is what "pre-installed"
+		// means for a raw container rather than a hosted action's own cache.
+		WithMountedCache("/root/.config/nuclei", dag.CacheVolume("dafs-nuclei-templates")).
 		WithServiceBinding("dafs", service).
 		// Fail the check only on findings that are actually actionable;
 		// informational output on an unauthenticated local API is noise.
@@ -454,6 +488,33 @@ find . -name '*.cdx.json' -not -path './target/*' -exec cp {} /out/ \;
 	return container.Directory("/out")
 }
 
+// SbomScan generates the CycloneDX SBOM (Sbom) and scans it with grype.
+//
+// Kept in lockstep with the `sbom` job in release.yml: cargo-audit/cargo-deny
+// (the `audit` job) check the dependency graph cargo itself sees; this checks
+// the SBOM that actually ships with a release, which is a real if narrow gap
+// between the two — a mismatch would mean the SBOM doesn't describe what
+// cargo-audit already cleared.
+func (m *DafsCi) SbomScan(ctx context.Context, source *dagger.Directory) (string, error) {
+	sbomDir := m.Sbom(source)
+
+	script := `set -e
+apk add --no-cache curl bash ca-certificates
+curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin v0.116.0
+status=0
+for f in /sbom/*.cdx.json; do
+  echo "== grype $f =="
+  grype "sbom:$f" --fail-on high || status=1
+done
+exit "$status"
+`
+	return dag.Container().
+		From("alpine:3.21").
+		WithMountedDirectory("/sbom", sbomDir).
+		WithExec([]string{"sh", "-c", script}).
+		Stdout(ctx)
+}
+
 // Check runs the whole suite concurrently and reports a per-check verdict.
 //
 // Every check runs even when an earlier one fails, and the failures are
@@ -478,6 +539,7 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory) (string, e
 		{"rss-ceiling", func() error { _, e := m.RssCeiling(ctx, source); return e }},
 		{"audit", func() error { _, e := m.Audit(ctx, source); return e }},
 		{"private-refs", func() error { _, e := m.PrivateRefs(ctx, source); return e }},
+		{"gitleaks", func() error { _, e := m.Gitleaks(ctx, source, ""); return e }},
 		{"ui-bundle", func() error { _, e := m.UiBundle(ctx, source); return e }},
 		{"dast", func() error { _, e := m.Dast(ctx, source); return e }},
 		{"fuzz", func() error { _, e := m.Fuzz(ctx, source, 30); return e }},
