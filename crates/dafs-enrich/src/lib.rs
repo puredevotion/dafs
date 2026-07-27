@@ -57,7 +57,7 @@ pub const MAX_INPUT_CHARS: usize = 8_000;
 #[derive(Debug, Clone)]
 pub struct Config {
     /// e.g. `http://localhost:11434/v1` (Ollama) or `https://api.openai.com/v1`.
-    /// This crate appends `/chat/completions` itself.
+    /// This crate appends `/chat/completions` or `/embeddings` itself.
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -67,6 +67,26 @@ pub struct Config {
     /// here depends entirely on what the caller pointed this at, so it's a
     /// field, not a constant.
     pub timeout: Duration,
+    /// M03 semantic search, opt-in independently of chat enrichment: `None`
+    /// means [`embed`] always returns [`EnrichError::EmbeddingsNotConfigured`],
+    /// the same "no default endpoint" posture the module docs describe for
+    /// `base_url` as a whole, applied one layer down. A chat model and an
+    /// embedding model are typically different models entirely (and often a
+    /// different dimensionality per model), so this is a distinct opt-in
+    /// rather than reusing `model` — see [`EmbeddingConfig`].
+    pub embedding: Option<EmbeddingConfig>,
+}
+
+/// The model to request embeddings from, and the vector width it produces.
+///
+/// `dimensions` is not discovered from a live response: `dafs_store`'s
+/// `file_embedding` table is created with a fixed column width up front (see
+/// `dafs_store::embeddings::ensure_table`), so the width has to be known
+/// before the first embedding is ever requested, not learned from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingConfig {
+    pub model: String,
+    pub dimensions: usize,
 }
 
 /// What one enrichment call produces. Every field optional: a model that
@@ -110,6 +130,23 @@ pub enum EnrichError {
 
     #[error("the model's JSON reply did not match the expected shape: {0}")]
     UnexpectedShape(#[source] serde_json::Error),
+
+    /// `embed()` called with `Config::embedding` unset — see that field's
+    /// docs on why embeddings are opt-in independently of chat enrichment.
+    #[error("no embedding model configured")]
+    EmbeddingsNotConfigured,
+
+    #[error("embeddings response had no data")]
+    NoEmbeddingData,
+
+    /// The endpoint returned a vector whose length doesn't match
+    /// `EmbeddingConfig::dimensions` — a misconfiguration (the admin named
+    /// the wrong model, or the endpoint's model was swapped underneath a
+    /// stable name) worth failing loudly on, since `dafs_store`'s vec0
+    /// column is a fixed width and would otherwise reject or corrupt it
+    /// further down the pipe with a far less clear error.
+    #[error("embedding model {model:?} returned {got} dimensions, configured for {expected}")]
+    UnexpectedDimensions { model: String, expected: usize, got: usize },
 }
 
 impl EnrichError {
@@ -223,6 +260,65 @@ pub fn enrich(text: &str, config: &Config) -> Result<Enrichment, EnrichError> {
     })
 }
 
+#[derive(Serialize)]
+struct EmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+}
+
+/// Send `text` to the configured embedding endpoint and return its vector.
+///
+/// Same input cap and truncation-at-a-char-boundary as [`enrich`], and the
+/// same reasoning: an embedding of a truncated document is still a useful
+/// embedding of that document's beginning, and nothing here can enforce a
+/// cap some earlier layer forgot to apply.
+pub fn embed(text: &str, config: &Config) -> Result<Vec<f32>, EnrichError> {
+    let embedding_config = config.embedding.as_ref().ok_or(EnrichError::EmbeddingsNotConfigured)?;
+    let capped = cap_input(text);
+    let url = format!("{}/embeddings", config.base_url.trim_end_matches('/'));
+
+    let request = EmbeddingRequest { model: &embedding_config.model, input: &capped };
+
+    let mut req = ureq::post(&url).timeout(config.timeout);
+    if let Some(key) = &config.api_key {
+        req = req.set("Authorization", &format!("Bearer {key}"));
+    }
+
+    let response = req.send_json(&request).map_err(|e| match e {
+        ureq::Error::Status(status, _) => {
+            EnrichError::Status { base_url: config.base_url.clone(), status }
+        }
+        other => {
+            EnrichError::Connection { base_url: config.base_url.clone(), source: Box::new(other) }
+        }
+    })?;
+
+    let body = response.into_string().map_err(EnrichError::Body)?;
+    let envelope: EmbeddingResponse =
+        serde_json::from_str(&body).map_err(EnrichError::MalformedEnvelope)?;
+    let vector = envelope.data.into_iter().next().ok_or(EnrichError::NoEmbeddingData)?.embedding;
+
+    if vector.len() != embedding_config.dimensions {
+        return Err(EnrichError::UnexpectedDimensions {
+            model: embedding_config.model.clone(),
+            expected: embedding_config.dimensions,
+            got: vector.len(),
+        });
+    }
+
+    Ok(vector)
+}
+
 fn cap_input(text: &str) -> String {
     match text.char_indices().nth(MAX_INPUT_CHARS) {
         Some((byte_idx, _)) => text[..byte_idx].to_string(),
@@ -324,6 +420,7 @@ mod tests {
             api_key: Some(secret.to_string()),
             model: "test-model".to_string(),
             timeout: Duration::from_secs(1),
+            embedding: None,
         };
 
         let err = enrich("some text", &config).expect_err("nothing is listening on this port");

@@ -15,4 +15,4 @@ cd "$repo_root"
 chmod +x .githooks/*
 git config core.hooksPath .githooks
 
-echo "commit-msg hook installed (core.hooksPath -> .githooks)"
+echo "hooks installed: commit-msg, pre-push (core.hooksPath -> .githooks)"

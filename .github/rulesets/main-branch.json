@@ -32,6 +32,7 @@
           { "context": "memory-budget" },
           { "context": "hermetic" },
           { "context": "audit" },
+          { "context": "gitleaks" },
           { "context": "fuzz-smoke" },
           { "context": "dast" },
           { "context": "no-private-references" },

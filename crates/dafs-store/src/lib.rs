@@ -8,7 +8,21 @@
 //! adds `file_metadata.body_text` (M02a's own extracted text, exposed for
 //! reuse rather than re-parsed) and `file_enrichment`/`enrichment_queue`
 //! (LLM-derived fields, kept in their own table — see the `enrichment`
-//! module).
+//! module). M03 adds `embedding_queue` (same durable-queue shape again) and,
+//! on demand rather than as a static migration, `file_embedding` — a
+//! `sqlite-vec` `vec0` virtual table for nearest-neighbour search over those
+//! embeddings — see the `embeddings` module for why that one table's
+//! creation can't be a plain append to `MIGRATIONS` the way every other
+//! table here is.
+//!
+//! # Every connection this crate opens can see vectors
+//!
+//! `open`/`open_in_memory` both call `dafs_vecstore::register()` before
+//! opening anything. That crate holds the one `unsafe` FFI call in this
+//! workspace that registers the `vec0` module — see its own docs for why —
+//! which keeps this crate's `forbid(unsafe_code)` intact while still making
+//! `CREATE VIRTUAL TABLE ... USING vec0(...)` and `... MATCH ...` queries
+//! work everywhere a connection is opened, tests included.
 //!
 //! # Paths are interned, not stored
 //!
@@ -41,6 +55,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+pub mod embeddings;
 pub mod enrichment;
 pub mod events;
 pub mod metadata;
@@ -75,6 +90,15 @@ pub enum StoreError {
     /// something else and a fabricated root row would be hard to notice.
     #[error("path has no components")]
     EmptyPath,
+
+    /// `embeddings::ensure_table` was asked for a model/dimensionality that
+    /// doesn't match what `file_embedding` was already created with. Boxed:
+    /// this variant is far larger than every other (`DimensionMismatch`
+    /// carries two owned `String`s), and `clippy::result_large_err` is right
+    /// that bloating every `Result<_, StoreError>` return by that much for a
+    /// variant that fires once per misconfigured deployment is a bad trade.
+    #[error(transparent)]
+    EmbeddingDimensionMismatch(#[from] Box<embeddings::DimensionMismatch>),
 }
 
 /// One forward-only schema step.
@@ -280,6 +304,37 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX enrichment_queue_order ON enrichment_queue(queued_at_unix ASC);
     ",
     },
+    Migration {
+        version: 5,
+        name: "embeddings",
+        sql: "
+        -- Same durable-queue shape as enrichment_queue, and the same
+        -- attempt_count poison-file cap. Nothing enqueues here unconditionally
+        -- — driven by the daemon only once embeddings are configured.
+        CREATE TABLE embedding_queue (
+            file_id        INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            queued_at_unix INTEGER NOT NULL,
+            attempt_count  INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+
+        CREATE INDEX embedding_queue_order ON embedding_queue(queued_at_unix ASC);
+
+        -- Bookkeeping for `file_embedding`, the vec0 virtual table `embeddings`
+        -- creates on demand — see that module's `ensure_table` for why the
+        -- vec0 table itself is not part of this static, append-only migration
+        -- list: its column width is fixed at creation time to whatever
+        -- embedding model the deployment is configured with, which is a
+        -- per-deployment choice this shared migration list has no way to
+        -- express. This row is what lets a later run notice its configured
+        -- model or dimensionality changed, instead of silently corrupting a
+        -- fixed-width column.
+        CREATE TABLE embedding_config (
+            id         INTEGER PRIMARY KEY CHECK (id = 1),
+            model      TEXT    NOT NULL,
+            dimensions INTEGER NOT NULL
+        ) STRICT;
+    ",
+    },
 ];
 
 /// The highest schema version this build understands.
@@ -290,6 +345,7 @@ pub fn supported_version() -> u32 {
 /// Open (creating if absent) the metadata database at `path`, apply any pending
 /// migrations, and return the tuned connection.
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
+    dafs_vecstore::register();
     let conn = Connection::open(path)?;
     tune(&conn)?;
     migrate(&conn)?;
@@ -299,6 +355,7 @@ pub fn open(path: &Path) -> Result<Connection, StoreError> {
 /// Open an in-memory database for tests. Same tuning and migrations, so a test
 /// exercises the real schema rather than a hand-rolled approximation.
 pub fn open_in_memory() -> Result<Connection, StoreError> {
+    dafs_vecstore::register();
     let conn = Connection::open_in_memory()?;
     tune(&conn)?;
     migrate(&conn)?;

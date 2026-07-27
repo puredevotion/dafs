@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Query, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::IntoResponse,
     routing::get,
 };
@@ -201,7 +202,25 @@ pub fn router(state: AppState) -> Router {
         // it. 64 KiB is far above any legitimate body and far below anything
         // that matters.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        // Every route sets an explicit Content-Type already, so there is
+        // nothing for a browser to sniff — this just removes the guess
+        // entirely. `.zap/rules.tsv` rule 10021 tracked this as a WARN
+        // ("worth adding anyway"); this closes it rather than leaving it
+        // tracked-but-unfixed.
+        .layer(middleware::from_fn(set_security_headers))
         .with_state(state)
+}
+
+/// Sets response headers ZAP's baseline flags as worth having regardless of
+/// the loopback-only, unauthenticated threat model documented in
+/// `.zap/rules.tsv` — cheap to add, no reason to leave them as a tracked WARN.
+async fn set_security_headers(request: Request, next: Next) -> impl IntoResponse {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Query parameters for `/events`.
@@ -683,6 +702,24 @@ mod tests {
             .await
             .expect("request");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn every_response_sets_x_content_type_options_nosniff() {
+        // .zap/rules.tsv 10021 — asserted here rather than left to the ZAP
+        // baseline alone, so a route added outside the router-level layer
+        // (there is no such route today, but the point is to catch one that
+        // ever bypasses it) fails a fast local test, not just a CI scan.
+        let state = AppState::new(1);
+        let app = router(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.headers().get(axum::http::header::X_CONTENT_TYPE_OPTIONS).expect("header present"),
+            "nosniff"
+        );
     }
 
     #[tokio::test]

@@ -272,6 +272,12 @@ async fn run(
         api_key: args.llm_api_key.clone(),
         model: args.llm_model.clone().expect("clap requires ties llm_model to llm_base_url"),
         timeout: Duration::from_secs(args.llm_timeout_secs),
+        // M03 embeddings are foundational (dafs-enrich::embed,
+        // dafs-store::embeddings) but not yet wired to a CLI flag, a worker
+        // that drains embedding_queue, or the search API — see
+        // docs/m03-semantic-search.md's "Next" section. Always `None` here
+        // until that wiring lands, rather than a flag nothing yet consumes.
+        embedding: None,
     });
 
     if let Some(config) = &llm_config {

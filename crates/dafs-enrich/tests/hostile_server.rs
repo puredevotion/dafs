@@ -33,6 +33,7 @@ fn test_config(base_url: String) -> Config {
         api_key: None,
         model: "test-model".to_string(),
         timeout: Duration::from_secs(5),
+        embedding: None,
     }
 }
 

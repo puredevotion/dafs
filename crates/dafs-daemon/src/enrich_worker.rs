@@ -315,6 +315,7 @@ mod tests {
             api_key: None,
             model: "test-model".to_string(),
             timeout: Duration::from_secs(5),
+            embedding: None,
         };
 
         process_one(&conn, file_id, &config);
@@ -350,6 +351,7 @@ mod tests {
             api_key: None,
             model: "unused".to_string(),
             timeout: Duration::from_millis(50),
+            embedding: None,
         };
 
         process_one(&conn, file_id, &config);
@@ -382,6 +384,7 @@ mod tests {
             api_key: None,
             model: "unused".to_string(),
             timeout: Duration::from_secs(1),
+            embedding: None,
         };
 
         process_one(&conn, file_id, &config);
