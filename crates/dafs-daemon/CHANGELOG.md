@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.5](https://github.com/puredevotion/dafs/compare/v0.0.4...v0.0.5) (2026-07-27)
+
+
+### Features
+
+* **search:** lay the M03 vector-search foundation ([153cfee](https://github.com/puredevotion/dafs/commit/153cfee96505ca010e44dd732e4f14af26741146))
+
 ## [0.0.4](https://github.com/puredevotion/dafs/compare/v0.0.3...v0.0.4) (2026-07-26)
 
 
