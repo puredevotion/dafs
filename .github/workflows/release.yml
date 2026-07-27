@@ -4,6 +4,45 @@
 # Dagger module in ci/ which runs anywhere. This workflow is the one thing that
 # is genuinely GitHub-specific: cutting a release, attaching artifacts, and
 # publishing provenance.
+#
+# # Supply-chain posture (SLSA)
+#
+# `actions/attest-build-provenance` is kept rather than switching to
+# slsa-framework/slsa-github-generator's reusable workflow — that generator is
+# what actually earns a certified SLSA Build L3 (an isolated, non-forkable
+# trusted builder that the calling workflow cannot influence after the fact);
+# a normal job in this workflow is not that, no matter how it's hardened, since
+# arbitrary steps here still run with the same token that signs the
+# attestation. What follows is "as good as that gets without adopting a
+# different builder", not a claim of certified L3:
+#
+#   - Every third-party action below is pinned to a commit SHA, not a
+#     floating tag, with the tag kept only as a trailing comment. A compromised
+#     or re-tagged action version cannot inject anything into a build whose
+#     provenance is then attested as trustworthy — this is the actual
+#     falsifiability gap between "provenance exists" and "provenance means
+#     something", and it's the one thing here fully in this repo's control.
+#   - Permissions are scoped per job, not just at the workflow level: only
+#     `build` and `sbom` carry `id-token`/`attestations` write, `verify` is
+#     read-only, and `publish` (which never builds anything) carries neither.
+#     A step compromised in one job cannot mint an attestation for another.
+#   - The build has no secrets and no network beyond crates.io/npm during
+#     dependency fetch (see `hermetic` in ci.yml) — there is nothing an
+#     attacker-controlled build step could exfiltrate that this token doesn't
+#     already make irrelevant, and nothing it could reach that isn't already
+#     public.
+#   - Every attestable output is attested, not just the primary binary: the
+#     tarball, its detached checksum, and the CycloneDX SBOM all get subjects
+#     ("max provenance" in the sense of maximal coverage of what ships).
+#
+# The Dagger module (`ci/`) mirrors `build` and `sbom` byte-for-byte so a
+# release is reproducible outside GitHub too, but it cannot mint this
+# attestation itself: Sigstore-backed signing needs the ambient OIDC identity
+# only GitHub Actions' `id-token: write` provides, and Dagger has no
+# equivalent when run standalone. That split is deliberate, not a gap — same
+# division `ci/main.go`'s own docs already draw for `publish`: Dagger produces
+# the artifact, the GitHub workflow that has the OIDC identity is what attests
+# and ships it.
 name: Release
 
 on:
@@ -15,10 +54,9 @@ on:
         description: "Tag to build (for a manual re-run)"
         required: true
 
+# No default write access. Every job below states exactly what it needs.
 permissions:
-  contents: write # creating the release and uploading assets
-  id-token: write # provenance attestation
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,12 +67,14 @@ jobs:
   # having been through a pull request.
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features
         env:
@@ -46,6 +86,10 @@ jobs:
   build:
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # provenance attestation
+      attestations: write
     strategy:
       matrix:
         include:
@@ -54,11 +98,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             name: dafs-aarch64-linux
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # jemalloc and bundled SQLite are C, so cross-compiling needs a cross
       # linker and compiler — not just a Rust target.
@@ -88,11 +132,16 @@ jobs:
           tar -czf ${{ matrix.name }}.tar.gz -C "$(dirname "$BIN")" dafs
           sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
 
-      - uses: actions/attest-build-provenance@v2
+      # One call, two subjects: the tarball and its detached checksum both get
+      # covered by the same provenance statement, rather than attesting only
+      # the binary and leaving the checksum file unattested alongside it.
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: ${{ matrix.name }}.tar.gz
+          subject-path: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.name }}
           path: |
@@ -102,15 +151,48 @@ jobs:
   sbom:
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # provenance attestation
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Generate CycloneDX SBOM
         run: |
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --all
           find . -name '*.cdx.json' -not -path './target/*' -print
-      - uses: actions/upload-artifact@v4
+
+      # cargo-audit/cargo-deny (ci.yml's `audit` job) check the dependency
+      # graph cargo itself sees. This checks the SBOM that actually ships
+      # with the release instead — a real, if narrow, gap between the two:
+      # a mismatch here would mean the SBOM doesn't describe what cargo-audit
+      # already cleared, which is its own bug worth catching.
+      - name: Install grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin v0.116.0
+          grype version
+
+      - name: Scan the generated SBOM for known vulnerabilities
+        run: |
+          status=0
+          while IFS= read -r sbom; do
+            echo "::group::grype $sbom"
+            grype "sbom:$sbom" --fail-on high || status=1
+            echo "::endgroup::"
+          done < <(find . -name '*.cdx.json' -not -path './target/*')
+          exit "$status"
+
+      # The SBOM is a shipped release artifact like the tarballs are — attest
+      # it too, so "max provenance" covers what describes the release, not
+      # only the binary itself.
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: "**/*.cdx.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom
           path: "**/*.cdx.json"
@@ -118,9 +200,11 @@ jobs:
   publish:
     needs: [build, sbom]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # creating the release and uploading assets
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
       - name: Attach artifacts to the release
