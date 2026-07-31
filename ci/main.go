@@ -80,16 +80,32 @@ const (
 // DafsCi is the CI module root.
 type DafsCi struct{}
 
-// rustBase returns a Rust container with the source mounted and cargo's caches
-// wired to Dagger cache volumes, so repeated local runs do not recompile the
-// world. The volumes are shared across invocations on the same engine.
+// rustBase returns a Rust container with the source copied in and cargo's
+// caches wired to Dagger cache volumes, so repeated local runs do not
+// recompile the world. The volumes are shared across invocations on the same
+// engine.
+//
+// WithDirectory (copy), not WithMountedDirectory (bind mount), for `source`
+// here and at every other call site in this file: per BuildKit's own
+// documented behavior (dagger/dagger#6421), a mounted directory only gets
+// content-hash cache validation when it is BOTH a non-root mount AND
+// read-only. A plain writable WithMountedDirectory -- what every one of
+// these call sites used before -- skips that check entirely, so a cached
+// downstream layer can legally be reused even when the mounted source
+// content actually changed. WithDirectory copies the content into the
+// container's own filesystem layer instead, which is always content-
+// addressed like any other layer, no such carve-out. Same fix applied to
+// coredns-plugins' own ci/main.go after a live incident there (a pod found
+// serving a cert for an SNI name absent from its own Corefile, root-caused
+// as a stale/cached vendored-source layer) surfaced this exact BuildKit
+// behavior.
 func (m *DafsCi) rustBase(source *dagger.Directory, image string) *dagger.Container {
 	return dag.Container().
 		From(image).
 		WithMountedCache("/usr/local/cargo/registry", dag.CacheVolume("dafs-cargo-registry")).
 		WithMountedCache("/usr/local/cargo/git", dag.CacheVolume("dafs-cargo-git")).
 		WithMountedCache("/src/target", dag.CacheVolume("dafs-cargo-target")).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		// Match the GitHub workflow: warnings fail. Kept out of the source so
 		// local iteration is not painful.
@@ -128,7 +144,7 @@ echo "all commit subjects are Conventional Commits"`, pattern, base)
 	return dag.Container().
 		From("alpine:3.21").
 		WithExec([]string{"apk", "add", "--no-cache", "git", "bash"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"bash", "-c", script}).
 		Stdout(ctx)
@@ -146,7 +162,7 @@ func (m *DafsCi) CargoVersions(ctx context.Context, source *dagger.Directory) (s
 	return dag.Container().
 		From("alpine:3.21").
 		WithExec([]string{"apk", "add", "--no-cache", "gawk", "grep"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "scripts/check-crate-versions.sh"}).
 		Stdout(ctx)
@@ -278,7 +294,7 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 
 	return dag.Container().
 		From("alpine:3.21").
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
@@ -297,7 +313,7 @@ func (m *DafsCi) Gitleaks(ctx context.Context, source *dagger.Directory, base st
 
 	return dag.Container().
 		From(gitleaksImage).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"gitleaks", "git", "--log-opts=" + base + "..HEAD", "--redact", "--no-banner", "."}).
 		Stdout(ctx)
@@ -388,7 +404,7 @@ echo "committed bundle matches a fresh build, and is a single file"`
 		From(nodeImage).
 		// git is needed for the diff below and is not in the base node image.
 		WithExec([]string{"apk", "add", "--no-cache", "git"}).
-		WithMountedDirectory("/src", source).
+		WithDirectory("/src", source).
 		WithWorkdir("/src").
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
@@ -510,7 +526,7 @@ exit "$status"
 `
 	return dag.Container().
 		From("alpine:3.21").
-		WithMountedDirectory("/sbom", sbomDir).
+		WithDirectory("/sbom", sbomDir).
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
 }
