@@ -99,16 +99,20 @@ type DafsCi struct{}
 // recompile the world. The volumes are shared across invocations on the same
 // engine.
 //
-// WithDirectory (copy), not WithMountedDirectory (bind mount), for `source`:
-// per BuildKit's own documented behavior (dagger/dagger#6421, still open), a
-// mounted directory only gets content-hash cache validation when it is BOTH
-// a non-root mount AND read-only. A plain writable WithMountedDirectory —
-// what every call site in this file used before — skips that check entirely
-// and can legally reuse a cached downstream layer even when the mounted
+// WithDirectory (copy), not WithMountedDirectory (bind mount), for `source`
+// here and at every other call site in this file: per BuildKit's own
+// documented behavior (dagger/dagger#6421), a mounted directory only gets
+// content-hash cache validation when it is BOTH a non-root mount AND
+// read-only. A plain writable WithMountedDirectory -- what every one of
+// these call sites used before -- skips that check entirely, so a cached
+// downstream layer can legally be reused even when the mounted source
 // content actually changed. WithDirectory copies the content into the
-// container's own filesystem layer instead, which is always content-addressed
-// like any other layer, with no such carve-out. Every other WithMountedDirectory
-// call in this file has the same fix for the same reason.
+// container's own filesystem layer instead, which is always content-
+// addressed like any other layer, no such carve-out. Same fix applied to
+// coredns-plugins' own ci/main.go after a live incident there (a pod found
+// serving a cert for an SNI name absent from its own Corefile, root-caused
+// as a stale/cached vendored-source layer) surfaced this exact BuildKit
+// behavior.
 func (m *DafsCi) rustBase(source *dagger.Directory, image string) *dagger.Container {
 	return dag.Container().
 		From(image).
