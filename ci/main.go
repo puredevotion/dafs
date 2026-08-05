@@ -526,7 +526,7 @@ find . -name '*.cdx.json' -not -path './target/*' -exec cp {} /out/ \;
 // between the two — a mismatch would mean the SBOM doesn't describe what
 // cargo-audit already cleared.
 func (m *DafsCi) SbomScan(ctx context.Context, source *dagger.Directory) (string, error) {
-	sbomDir := m.Sbom(source)
+	sbomDir := m.Sbom(ctx, source)
 
 	script := `set -e
 apk add --no-cache curl bash ca-certificates
