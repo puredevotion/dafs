@@ -1,3 +1,12 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json"
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "Group routine Cargo patch/minor bumps into one PR — this repo gates every PR on fuzz/hermetic/RSS-ceiling checks, so fewer, batched dependency PRs cost less CI time than one PR per crate.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "cargo non-major"
+    }
+  ]
 }
