@@ -23,8 +23,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 # TLS off: this talks to a loopback HTTP daemon, and pulling in a TLS stack
 # for a status client that never needs one is exactly the kind of dependency
 # weight the rest of this workspace avoids. `json` enables `Response::into_json`.
