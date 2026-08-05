@@ -63,7 +63,7 @@ impl Daemon {
     /// invoke cargo, so a stale binary would be measured silently. `binary()`
     /// checks the mtime against the source tree to catch that.
     pub fn spawn(binary: &Path) -> std::io::Result<Self> {
-        Self::spawn_inner(binary, None)
+        Self::spawn_inner(binary, None, &[])
     }
 
     /// Spawn the release daemon watching `watch`, for scenarios that need it
@@ -71,10 +71,26 @@ impl Daemon {
     /// deliberately watch-free, which is a different (and less realistic)
     /// startup path than every real deployment takes.
     pub fn spawn_watching(binary: &Path, watch: &Path) -> std::io::Result<Self> {
-        Self::spawn_inner(binary, Some(watch))
+        Self::spawn_inner(binary, Some(watch), &[])
     }
 
-    fn spawn_inner(binary: &Path, watch: Option<&Path>) -> std::io::Result<Self> {
+    /// Spawn the release daemon watching `watch`, with `extra_args` appended
+    /// to the command line — for scenarios that need CLI flags `spawn`/
+    /// `spawn_watching` don't take, e.g. M03's `--llm-base-url`/
+    /// `--llm-embedding-model` pair.
+    pub fn spawn_watching_with_args(
+        binary: &Path,
+        watch: &Path,
+        extra_args: &[&str],
+    ) -> std::io::Result<Self> {
+        Self::spawn_inner(binary, Some(watch), extra_args)
+    }
+
+    fn spawn_inner(
+        binary: &Path,
+        watch: Option<&Path>,
+        extra_args: &[&str],
+    ) -> std::io::Result<Self> {
         let data_dir = tempfile::tempdir()?;
         // Port 0 lets the OS choose, avoiding collisions when tests run in
         // parallel; the daemon logs the bound address, but reading it back from
@@ -101,6 +117,7 @@ impl Daemon {
         if let Some(watch) = watch {
             cmd.arg("--watch").arg(watch);
         }
+        cmd.args(extra_args);
         let child =
             cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn()?;
 

@@ -278,12 +278,7 @@ pub fn timeline(
     // reasoning gives `file_enrichment` a second LEFT JOIN — enrichment is
     // optional and typically arrives even later than extraction.
     let sql = format!(
-        "SELECT e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
-                f.is_dir, e.prev_parent_id, e.prev_component_id,
-                fm.doc_type, fm.title, fm.author, fm.language, fm.page_count, fm.word_count,
-                fm.image_taken_at_unix, fm.image_camera_model, fm.git_branch,
-                fm.git_head_commit, fm.git_head_author, fm.git_head_at_unix,
-                fe.summary, fe.keywords, fe.entities, fe.classification
+        "SELECT {EVENT_COLUMNS}
            FROM events e
            JOIN files f ON f.id = e.file_id
            LEFT JOIN file_metadata fm ON fm.file_id = e.file_id
@@ -294,43 +289,59 @@ pub fn timeline(
 
     let mut stmt = conn.prepare_cached(&sql)?;
 
-    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RawEvent> {
-        Ok(RawEvent {
-            id: r.get(0)?,
-            file_id: r.get(1)?,
-            kind: r.get::<_, String>(2)?,
-            at_unix_ms: r.get(3)?,
-            size_bytes: r.get(4)?,
-            is_dir: r.get::<_, i64>(5)? != 0,
-            prev_parent_id: r.get(6)?,
-            prev_component_id: r.get(7)?,
-            doc_type: r.get(8)?,
-            title: r.get(9)?,
-            author: r.get(10)?,
-            language: r.get(11)?,
-            page_count: r.get(12)?,
-            word_count: r.get(13)?,
-            image_taken_at_unix: r.get(14)?,
-            image_camera_model: r.get(15)?,
-            git_branch: r.get(16)?,
-            git_head_commit: r.get(17)?,
-            git_head_author: r.get(18)?,
-            git_head_at_unix: r.get(19)?,
-            summary: r.get(20)?,
-            keywords: r.get(21)?,
-            entities: r.get(22)?,
-            classification: r.get(23)?,
-        })
-    };
-
     let raw: Vec<RawEvent> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), map_row)?
+        .query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), parse_raw_event)?
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Path resolution is a separate pass rather than a recursive CTE in the
-    // query: the walk is short, the rows are already limited to one page, and
-    // keeping it in Rust means one implementation of path reconstruction
-    // instead of a second one in SQL that could disagree with it.
+    raw_to_entries(conn, raw)
+}
+
+/// The joined event/metadata/enrichment columns every query in this module
+/// selects, in a fixed order — shared between [`timeline`] and
+/// [`latest_for_file_ids`] so the two queries' `SELECT` lists and row mapping
+/// cannot silently drift apart from each other.
+const EVENT_COLUMNS: &str = "e.id, e.file_id, e.kind, e.at_unix_ms, e.size_bytes,
+                f.is_dir, e.prev_parent_id, e.prev_component_id,
+                fm.doc_type, fm.title, fm.author, fm.language, fm.page_count, fm.word_count,
+                fm.image_taken_at_unix, fm.image_camera_model, fm.git_branch,
+                fm.git_head_commit, fm.git_head_author, fm.git_head_at_unix,
+                fe.summary, fe.keywords, fe.entities, fe.classification";
+
+fn parse_raw_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
+    Ok(RawEvent {
+        id: r.get(0)?,
+        file_id: r.get(1)?,
+        kind: r.get::<_, String>(2)?,
+        at_unix_ms: r.get(3)?,
+        size_bytes: r.get(4)?,
+        is_dir: r.get::<_, i64>(5)? != 0,
+        prev_parent_id: r.get(6)?,
+        prev_component_id: r.get(7)?,
+        doc_type: r.get(8)?,
+        title: r.get(9)?,
+        author: r.get(10)?,
+        language: r.get(11)?,
+        page_count: r.get(12)?,
+        word_count: r.get(13)?,
+        image_taken_at_unix: r.get(14)?,
+        image_camera_model: r.get(15)?,
+        git_branch: r.get(16)?,
+        git_head_commit: r.get(17)?,
+        git_head_author: r.get(18)?,
+        git_head_at_unix: r.get(19)?,
+        summary: r.get(20)?,
+        keywords: r.get(21)?,
+        entities: r.get(22)?,
+        classification: r.get(23)?,
+    })
+}
+
+/// Path resolution is a separate pass over already-fetched rows rather than a
+/// recursive CTE in the query itself: the walk is short, the row count is
+/// already bounded by the caller, and keeping it in Rust means one
+/// implementation of path reconstruction instead of a second one in SQL that
+/// could disagree with it.
+fn raw_to_entries(conn: &Connection, raw: Vec<RawEvent>) -> Result<Vec<TimelineEntry>, StoreError> {
     let mut out = Vec::with_capacity(raw.len());
     for e in raw {
         let previous_path = match (e.prev_parent_id, e.prev_component_id) {
@@ -371,6 +382,52 @@ pub fn timeline(
     }
 
     Ok(out)
+}
+
+/// The most recent event for each of `file_ids`, joined to metadata and
+/// enrichment exactly like [`timeline`] — for M03 search, which ranks by
+/// `file_id` (from `dafs_store::embeddings::search`) and needs each hit's
+/// current display state, not the whole event history.
+///
+/// Returned in the same order as `file_ids` (the caller's ranking, e.g. by
+/// vector distance), not the query's own row order. A `file_id` with no event
+/// at all — not realistic in practice (nothing embeds a file before its
+/// first `created` event exists) but not ruled out by this function's own
+/// contract — is silently omitted rather than padding the result with a
+/// placeholder entry.
+pub fn latest_for_file_ids(
+    conn: &Connection,
+    file_ids: &[FileId],
+) -> Result<Vec<TimelineEntry>, StoreError> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS}
+           FROM events e
+           JOIN files f ON f.id = e.file_id
+           LEFT JOIN file_metadata fm ON fm.file_id = e.file_id
+           LEFT JOIN file_enrichment fe ON fe.file_id = e.file_id
+          WHERE e.id IN (
+              SELECT MAX(id) FROM events WHERE file_id IN ({placeholders}) GROUP BY file_id
+          )"
+    );
+
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let raw: Vec<RawEvent> = stmt
+        .query_map(rusqlite::params_from_iter(file_ids.iter()), parse_raw_event)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries = raw_to_entries(conn, raw)?;
+
+    // Re-sorted into `file_ids`' order: the query above has no `ORDER BY`
+    // matching it (a `GROUP BY`'s row order is not something to rely on), and
+    // the caller's ranking is the entire point of this function existing
+    // rather than `timeline` itself.
+    let mut by_file_id: std::collections::HashMap<FileId, TimelineEntry> =
+        entries.into_iter().map(|e| (e.file_id, e)).collect();
+    Ok(file_ids.iter().filter_map(|id| by_file_id.remove(id)).collect())
 }
 
 struct RawEvent {
@@ -827,5 +884,51 @@ mod tests {
 
         conn.execute("UPDATE files SET deleted_at = 1 WHERE id = ?1", [file]).expect("tombstone");
         assert_eq!(file_count(&conn).expect("count"), 0, "a tombstoned file was counted");
+    }
+
+    #[test]
+    fn latest_for_file_ids_returns_the_most_recent_event_per_file() {
+        let (conn, file) = db_with_file("/a/b");
+        append(&conn, &NewEvent::now(file, EventKind::Created).at(1_000)).expect("append");
+        append(&conn, &NewEvent::now(file, EventKind::Modified).at(2_000)).expect("append");
+
+        let entries = latest_for_file_ids(&conn, &[file]).expect("latest_for_file_ids");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, EventKind::Modified, "must be the newer of the two events");
+        assert_eq!(entries[0].at_unix_ms, 2_000);
+    }
+
+    #[test]
+    fn latest_for_file_ids_preserves_the_caller_s_order_not_the_query_s() {
+        let conn = crate::open_in_memory().expect("open");
+        let mut i = Interner::new();
+        let a = ensure_dir_chain(&conn, &mut i, Path::new("/a")).expect("a");
+        let b = ensure_dir_chain(&conn, &mut i, Path::new("/b")).expect("b");
+        // Inserted in an order that would sort the opposite way by id/time —
+        // proving the function reorders to match `file_ids`, not row order.
+        append(&conn, &NewEvent::now(a, EventKind::Created).at(1_000)).expect("append a");
+        append(&conn, &NewEvent::now(b, EventKind::Created).at(2_000)).expect("append b");
+
+        let entries = latest_for_file_ids(&conn, &[b, a]).expect("latest_for_file_ids");
+        let file_ids: Vec<FileId> = entries.iter().map(|e| e.file_id).collect();
+        assert_eq!(file_ids, vec![b, a]);
+    }
+
+    #[test]
+    fn latest_for_file_ids_omits_ids_with_no_event() {
+        let (conn, file) = db_with_file("/a/b");
+        append(&conn, &NewEvent::now(file, EventKind::Created)).expect("append");
+
+        // A file id that was never interned/eventful at all — the function
+        // must skip it, not error or fabricate a placeholder row.
+        let entries = latest_for_file_ids(&conn, &[file, 999_999]).expect("latest_for_file_ids");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, file);
+    }
+
+    #[test]
+    fn latest_for_file_ids_with_no_ids_returns_empty_without_querying() {
+        let (conn, _) = db_with_file("/a/b");
+        assert!(latest_for_file_ids(&conn, &[]).expect("latest_for_file_ids").is_empty());
     }
 }

@@ -7,7 +7,7 @@
 // taste.
 
 import "./style.css";
-import { fetchEvents, fetchFacets, fetchMetrics, fetchVersion } from "./api.js";
+import { fetchEvents, fetchFacets, fetchMetrics, fetchSearch, fetchVersion } from "./api.js";
 import { formatBytes, formatExact, formatWhen, groupByDay, splitPath } from "./format.js";
 
 /** How often the status strip and newest events refresh. */
@@ -54,6 +54,9 @@ const el = {
   message: document.getElementById("message"),
   more: document.getElementById("more"),
   filters: document.querySelector(".filters"),
+  searchForm: document.getElementById("search-form"),
+  searchInput: document.getElementById("search-input"),
+  searchClear: document.getElementById("search-clear"),
   // Populated by loadFacets, and only inserted into the page at all once at
   // least one facet field comes back — against today's daemon /facets 404s
   // for every field, so this stays null and the row never appears.
@@ -71,10 +74,26 @@ const state = {
   /** True once a page has come back empty, so "Load more" can be hidden. */
   exhausted: false,
   loading: false,
+  /**
+   * `null` outside search mode. While searching, the timeline's own kind/
+   * facet filters and pagination don't apply — a search result set is a
+   * ranked list, not a filtered page of the same append-only log — so
+   * search replaces the timeline's rendering rather than filtering it.
+   */
+  searchHits: null,
+  /** The query text the current `searchHits` were found for, for the
+   * "no matches" message. Meaningless while `searchHits` is `null`. */
+  searchQuery: "",
 };
 
-/** Replace the list with `entries`, grouped by day. */
+/** Replace the list with `entries`, grouped by day — or, in search mode,
+ * with the current search hits, ranked rather than grouped. */
 function render() {
+  if (state.searchHits !== null) {
+    renderSearchHits();
+    return;
+  }
+
   if (state.entries.length === 0) {
     el.timeline.replaceChildren();
     showMessage(
@@ -101,6 +120,26 @@ function render() {
   // the difference is not perceptible.
   el.timeline.replaceChildren(fragment);
   el.more.hidden = state.exhausted;
+}
+
+/** Render the current search hits, closest match first. No day grouping and
+ * no "Load more" — a search result is a fixed ranked list, not a page of an
+ * append-only log. */
+function renderSearchHits() {
+  el.more.hidden = true;
+
+  if (state.searchHits.length === 0) {
+    el.timeline.replaceChildren();
+    showMessage(`No matches for “${state.searchQuery}”.`);
+    return;
+  }
+
+  hideMessage();
+  const fragment = document.createDocumentFragment();
+  for (const hit of state.searchHits) {
+    fragment.append(searchHitRow(hit));
+  }
+  el.timeline.replaceChildren(fragment);
 }
 
 function dayHeading(label) {
@@ -170,6 +209,62 @@ function eventRow(entry) {
   return li;
 }
 
+/**
+ * A search hit: the same path/metadata rendering `eventRow` uses, with a
+ * match-strength badge in place of the created/modified/deleted/renamed
+ * kind badge — a search result has no "kind", but it does have a ranking,
+ * and showing that (rather than silently ordering the list by it) is what
+ * tells a reader why the top row is the top row.
+ */
+function searchHitRow(hit) {
+  const li = document.createElement("li");
+  li.className = "event search-hit";
+
+  const badge = document.createElement("span");
+  badge.className = "kind distance";
+  badge.textContent = formatDistance(hit.distance);
+  badge.title = `Euclidean distance: ${hit.distance}`;
+  li.append(badge);
+
+  const path = document.createElement("span");
+  path.className = "path";
+  const { directory, name } = splitPath(hit.path);
+
+  const dir = document.createElement("span");
+  dir.className = "dir";
+  dir.textContent = directory;
+  const base = document.createElement("span");
+  base.className = "name";
+  base.textContent = name;
+  path.append(dir, base);
+  path.title = hit.path;
+  li.append(path);
+
+  if (hit.summary) {
+    const summary = document.createElement("span");
+    summary.className = "summary";
+    summary.textContent = hit.summary;
+    li.append(summary);
+  }
+
+  const present = DETAIL_FIELDS.filter(({ key }) => hit[key] != null);
+  if (present.length > 0) {
+    li.append(detailsPanel(hit, present));
+    makeExpandable(li);
+  }
+
+  return li;
+}
+
+/** A short, unitless closeness reading — smaller is a better match. Rounded
+ * to 2 decimal places: the raw Euclidean distance is a real number with no
+ * inherent scale a reader can eyeball, so the exact value goes in the title
+ * tooltip instead (see `searchHitRow`) and this is only ever a relative cue
+ * for comparing rows against each other. */
+function formatDistance(distance) {
+  return distance.toFixed(2);
+}
+
 /** A hidden-by-default definition list of the extracted fields present on `entry`. */
 function detailsPanel(entry, fields) {
   const dl = document.createElement("dl");
@@ -223,6 +318,13 @@ function hideMessage() {
 
 /** Load the first page for the current filter, replacing what is shown. */
 async function loadFirstPage() {
+  // Loading the timeline's first page always means leaving search mode —
+  // the two views are mutually exclusive (see `state.searchHits`'s own
+  // comment), and every caller of this function (kind filters, facet
+  // filters, the initial page load) means "show me the timeline", not
+  // "refine the current search".
+  state.searchHits = null;
+
   state.loading = true;
   try {
     const page = await fetchEvents({ kind: state.kind, limit: PAGE_SIZE, facets: state.facets });
@@ -374,12 +476,78 @@ async function loadFacets() {
     const select = event.target.closest("select[data-facet]");
     if (!select) return;
     state.facets[select.dataset.facet] = select.value;
-    loadFirstPage();
+    // A facet change while a search is active narrows *that* search rather
+    // than leaving it — the facets apply just as much to a ranked result set
+    // as to the timeline, and silently dropping back to the timeline on a
+    // filter change would be a surprising way to lose the query.
+    if (state.searchHits !== null) {
+      runSearch(state.searchQuery);
+    } else {
+      loadFirstPage();
+    }
   });
 
   el.filters.insertAdjacentElement("afterend", container);
   el.facets = container;
 }
+
+/** Enter (or replace) search mode with `hits` for `query`. */
+function enterSearchMode(query, hits) {
+  state.searchQuery = query;
+  state.searchHits = hits;
+  el.searchClear.hidden = false;
+  render();
+}
+
+/** Leave search mode and go back to the timeline. A no-op if not searching. */
+function exitSearchMode() {
+  if (state.searchHits === null) return;
+  el.searchInput.value = "";
+  el.searchClear.hidden = true;
+  loadFirstPage();
+}
+
+/**
+ * Run a search for `query` against `/search`, entering search mode with the
+ * result. An empty (post-trim) query exits search mode instead of asking the
+ * daemon to embed nothing.
+ *
+ * A 503 gets a specific message rather than the generic failure text — it is
+ * the expected response from a daemon with no `--llm-embedding-model`
+ * configured (see `fetchSearch`'s own docs), not a real error, and reads very
+ * differently to someone who just tried to use the feature.
+ */
+async function runSearch(query) {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    exitSearchMode();
+    return;
+  }
+
+  state.loading = true;
+  try {
+    const { hits } = await fetchSearch(trimmed, { facets: state.facets });
+    enterSearchMode(trimmed, hits);
+  } catch (error) {
+    el.timeline.replaceChildren();
+    el.more.hidden = true;
+    showMessage(
+      error.status === 503
+        ? "Semantic search is not configured on this daemon."
+        : `Search failed: ${error.message}`,
+      true,
+    );
+  } finally {
+    state.loading = false;
+  }
+}
+
+el.searchForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  runSearch(el.searchInput.value);
+});
+
+el.searchClear.addEventListener("click", exitSearchMode);
 
 el.filters.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-kind]");

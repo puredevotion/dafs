@@ -11,3 +11,11 @@ publish = false
 
 [dependencies]
 tempfile.workspace = true
+
+[dev-dependencies]
+# Only for building minimal docx fixtures in the M03 search RSS scenario —
+# `dafs-extract`'s own `office.rs` tests already do exactly this for the
+# same reason: a real docx/xlsx/pptx-shaped archive without committing binary
+# fixtures for parts the reader code never looks at.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+serde_json.workspace = true
