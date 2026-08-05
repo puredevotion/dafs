@@ -166,6 +166,74 @@ h1 {
   outline-offset: 2px;
 }
 
+/* M03 semantic search */
+
+.search {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.search input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+}
+
+.search input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.search button {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.search button[type="submit"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.search button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.search button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The distance badge replaces the created/modified/deleted/renamed kind badge
+   on a search-result row — same shape, a colour of its own since "how close a
+   match" isn't one of those four states. */
+.kind.distance {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.search-hit .summary {
+  color: var(--muted);
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 28rem;
+}
+
 /* Timeline */
 
 .timeline {

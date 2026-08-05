@@ -36,6 +36,7 @@ use clap::Parser;
 
 mod control_client;
 mod detach;
+mod embed_worker;
 mod enrich_worker;
 mod extract_worker;
 mod pidfile;
@@ -179,6 +180,38 @@ struct Args {
     /// by deployment in a way a bounded local parse never does.
     #[arg(long = "llm-timeout-secs", env = "DAFS_LLM_TIMEOUT_SECS", default_value_t = 120)]
     llm_timeout_secs: u64,
+
+    /// Model name to request from the `/embeddings` route of the same
+    /// endpoint `--llm-base-url` names (M03 semantic search). A distinct
+    /// opt-in from `--llm-model`, not a reuse of it — see
+    /// `dafs_enrich::EmbeddingConfig`'s own docs on why an embedding model is
+    /// typically a different model, of a different fixed output width, from
+    /// whatever chat model is configured. `requires` on both this and
+    /// `--llm-embedding-dimensions` (and, transitively through
+    /// `--llm-base-url`'s own `requires` chain, on `--llm-model`) means
+    /// embeddings can only ever be configured alongside chat enrichment, on
+    /// the same endpoint — there is no code path to embeddings-only in this
+    /// daemon today.
+    #[arg(
+        long = "llm-embedding-model",
+        env = "DAFS_LLM_EMBEDDING_MODEL",
+        requires = "llm_embedding_dimensions"
+    )]
+    llm_embedding_model: Option<String>,
+
+    /// The embedding model's output width. Required together with
+    /// `--llm-embedding-model` for the same reason `--llm-model` requires
+    /// `--llm-base-url`: a model name with no known width is not enough to
+    /// create `file_embedding` (see `dafs_store::embeddings::ensure_table`),
+    /// and a width with no named model is meaningless. Not discovered from a
+    /// live response — see `EmbeddingConfig::dimensions`'s own docs on why
+    /// this has to be known up front.
+    #[arg(
+        long = "llm-embedding-dimensions",
+        env = "DAFS_LLM_EMBEDDING_DIMENSIONS",
+        requires = "llm_embedding_model"
+    )]
+    llm_embedding_dimensions: Option<usize>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -250,7 +283,7 @@ async fn run(
     let watch_control: dafs_api::WatchControlHandle =
         Arc::new(watch_adapter::DaemonWatchControl::new(Arc::clone(&shared_roots), command_tx));
 
-    let state = dafs_api::AppState::new(schema_version)
+    let mut state = dafs_api::AppState::new(schema_version)
         .with_timeline(Arc::clone(&timeline))
         .with_log_level(log_handle)
         .with_watch_control(watch_control)
@@ -266,18 +299,19 @@ async fn run(
     // `requires` on both `llm_base_url` and `llm_model` (see `Args`) means
     // clap has already rejected a half-set pair by the time we're here, so
     // either both are present or neither is — the `expect` below is a
-    // consequence of that parse-time invariant, not a runtime guess.
+    // consequence of that parse-time invariant, not a runtime guess. Same
+    // reasoning for `llm_embedding_model`/`llm_embedding_dimensions` below.
     let llm_config = args.llm_base_url.clone().map(|base_url| dafs_enrich::Config {
         base_url,
         api_key: args.llm_api_key.clone(),
         model: args.llm_model.clone().expect("clap requires ties llm_model to llm_base_url"),
         timeout: Duration::from_secs(args.llm_timeout_secs),
-        // M03 embeddings are foundational (dafs-enrich::embed,
-        // dafs-store::embeddings) but not yet wired to a CLI flag, a worker
-        // that drains embedding_queue, or the search API — see
-        // docs/m03-semantic-search.md's "Next" section. Always `None` here
-        // until that wiring lands, rather than a flag nothing yet consumes.
-        embedding: None,
+        embedding: args.llm_embedding_model.clone().map(|model| dafs_enrich::EmbeddingConfig {
+            model,
+            dimensions: args
+                .llm_embedding_dimensions
+                .expect("clap requires ties llm_embedding_dimensions to llm_embedding_model"),
+        }),
     });
 
     if let Some(config) = &llm_config {
@@ -290,8 +324,12 @@ async fn run(
         );
     }
 
+    let enrichment_enabled = llm_config.is_some();
+    let embedding_config = llm_config.as_ref().and_then(|c| c.embedding.clone());
+    let embedding_enabled = embedding_config.is_some();
+
     let observer = spawn_observer(&args, &db_path, shared_roots, command_rx)?;
-    let extract_worker = extract_worker::spawn(&db_path, llm_config.is_some())
+    let extract_worker = extract_worker::spawn(&db_path, enrichment_enabled, embedding_enabled)
         .context("spawning extraction worker")?;
     let enrich_worker = match &llm_config {
         Some(config) => Some(
@@ -301,6 +339,27 @@ async fn run(
         // isn't configured — see `enrich_worker`'s module docs.
         None => None,
     };
+    let embed_worker = match &llm_config {
+        // `embed_worker` needs the whole `Config`, not just `EmbeddingConfig`
+        // — `dafs_enrich::embed` reaches `base_url`/`api_key`/`timeout`
+        // through it, same as `enrich` does. Mirrors `enrich_worker` exactly,
+        // including only spawning at all when embeddings are configured.
+        Some(config) if embedding_enabled => Some(
+            embed_worker::spawn(&db_path, config.clone()).context("spawning embedding worker")?,
+        ),
+        _ => None,
+    };
+
+    if let Some(config) = &llm_config
+        && embedding_enabled
+    {
+        // A connection of its own — see `SqliteSearch`'s own module docs on
+        // why it doesn't share `timeline`'s.
+        let search_conn = dafs_store::open(&db_path)
+            .with_context(|| format!("opening a search connection at {}", db_path.display()))?;
+        state = state
+            .with_search(Arc::new(store_adapter::SqliteSearch::new(search_conn, config.clone())));
+    }
 
     // The requested IP (so a wildcard bind address, which a reconciling
     // client could not usefully connect back to, never ends up in the
@@ -323,6 +382,9 @@ async fn run(
     extract_worker.shutdown();
     if let Some(enrich_worker) = enrich_worker {
         enrich_worker.shutdown();
+    }
+    if let Some(embed_worker) = embed_worker {
+        embed_worker.shutdown();
     }
     pidfile::remove(&canonical_data_dir);
 
@@ -1066,5 +1128,53 @@ mod cli_tests {
         assert!(cli.args.llm_base_url.is_none(), "enrichment must be opt-in, not default-on");
         assert!(cli.args.llm_model.is_none());
         assert_eq!(cli.args.llm_timeout_secs, 120);
+        assert!(cli.args.llm_embedding_model.is_none(), "embeddings must be opt-in too");
+        assert!(cli.args.llm_embedding_dimensions.is_none());
+    }
+
+    #[test]
+    fn llm_embedding_model_without_dimensions_is_a_parse_error() {
+        let result = Cli::try_parse_from([
+            "dafs",
+            "--llm-base-url",
+            "http://localhost:11434/v1",
+            "--llm-model",
+            "llama3",
+            "--llm-embedding-model",
+            "nomic-embed-text",
+        ]);
+        assert!(result.is_err(), "an embedding model with no dimensions must fail to parse");
+    }
+
+    #[test]
+    fn llm_embedding_dimensions_without_a_model_is_a_parse_error() {
+        let result = Cli::try_parse_from([
+            "dafs",
+            "--llm-base-url",
+            "http://localhost:11434/v1",
+            "--llm-model",
+            "llama3",
+            "--llm-embedding-dimensions",
+            "768",
+        ]);
+        assert!(result.is_err(), "dimensions with no embedding model must fail to parse");
+    }
+
+    #[test]
+    fn llm_embedding_model_and_dimensions_together_parse() {
+        let cli = Cli::try_parse_from([
+            "dafs",
+            "--llm-base-url",
+            "http://localhost:11434/v1",
+            "--llm-model",
+            "llama3",
+            "--llm-embedding-model",
+            "nomic-embed-text",
+            "--llm-embedding-dimensions",
+            "768",
+        ])
+        .expect("both together must parse");
+        assert_eq!(cli.args.llm_embedding_model.as_deref(), Some("nomic-embed-text"));
+        assert_eq!(cli.args.llm_embedding_dimensions, Some(768));
     }
 }

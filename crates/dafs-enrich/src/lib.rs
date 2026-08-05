@@ -246,8 +246,19 @@ pub fn enrich(text: &str, config: &Config) -> Result<Enrichment, EnrichError> {
     })?;
 
     let body = response.into_string().map_err(EnrichError::Body)?;
+    parse_chat_response(&body)
+}
+
+/// The network-free half of [`enrich`]: parse a chat-completions response
+/// body into an [`Enrichment`]. Split out so a fuzz target can drive this
+/// directly on arbitrary bytes without standing up a mock HTTP server —
+/// `body` here is exactly what a hostile or merely broken endpoint controls,
+/// same as the `content` string [`parse_model_reply`] already defends
+/// against, one layer further out (the envelope itself, not just the JSON
+/// nested inside it).
+pub fn parse_chat_response(body: &str) -> Result<Enrichment, EnrichError> {
     let envelope: ChatResponse =
-        serde_json::from_str(&body).map_err(EnrichError::MalformedEnvelope)?;
+        serde_json::from_str(body).map_err(EnrichError::MalformedEnvelope)?;
     let content = &envelope.choices.first().ok_or(EnrichError::NoChoices)?.message.content;
 
     let reply = parse_model_reply(content)?;
@@ -304,14 +315,27 @@ pub fn embed(text: &str, config: &Config) -> Result<Vec<f32>, EnrichError> {
     })?;
 
     let body = response.into_string().map_err(EnrichError::Body)?;
+    parse_embedding_response(&body, &embedding_config.model, embedding_config.dimensions)
+}
+
+/// The network-free half of [`embed`]: parse an embeddings-endpoint response
+/// body into a dimension-checked vector. Split out for the same reason as
+/// [`parse_chat_response`] — a fuzz target can call this directly on
+/// arbitrary bytes, exercising the same JSON parsing `embed` relies on
+/// without a mock server standing in for the network call.
+pub fn parse_embedding_response(
+    body: &str,
+    model: &str,
+    expected_dimensions: usize,
+) -> Result<Vec<f32>, EnrichError> {
     let envelope: EmbeddingResponse =
-        serde_json::from_str(&body).map_err(EnrichError::MalformedEnvelope)?;
+        serde_json::from_str(body).map_err(EnrichError::MalformedEnvelope)?;
     let vector = envelope.data.into_iter().next().ok_or(EnrichError::NoEmbeddingData)?.embedding;
 
-    if vector.len() != embedding_config.dimensions {
+    if vector.len() != expected_dimensions {
         return Err(EnrichError::UnexpectedDimensions {
-            model: embedding_config.model.clone(),
-            expected: embedding_config.dimensions,
+            model: model.to_string(),
+            expected: expected_dimensions,
             got: vector.len(),
         });
     }
@@ -383,6 +407,63 @@ mod tests {
     fn malformed_json_between_braces_is_an_error_not_a_panic() {
         let err = parse_model_reply("{not: valid, json}").unwrap_err();
         assert!(matches!(err, EnrichError::UnexpectedShape(_)));
+    }
+
+    #[test]
+    fn parse_chat_response_reads_the_first_choice() {
+        let enrichment = parse_chat_response(
+            r#"{"choices":[{"message":{"content":"{\"summary\": \"Ok.\", \"keywords\": [], \"entities\": [], \"classification\": \"note\"}"}}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(enrichment.summary.as_deref(), Some("Ok."));
+        assert_eq!(enrichment.classification.as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn parse_chat_response_rejects_a_malformed_envelope() {
+        let err = parse_chat_response("not json at all").unwrap_err();
+        assert!(matches!(err, EnrichError::MalformedEnvelope(_)));
+    }
+
+    #[test]
+    fn parse_chat_response_rejects_an_envelope_with_no_choices() {
+        let err = parse_chat_response(r#"{"choices":[]}"#).unwrap_err();
+        assert!(matches!(err, EnrichError::NoChoices));
+    }
+
+    #[test]
+    fn parse_embedding_response_returns_a_matching_width_vector() {
+        let vector =
+            parse_embedding_response(r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#, "test-model", 3)
+                .expect("parse");
+        assert_eq!(vector, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn parse_embedding_response_rejects_a_malformed_envelope() {
+        let err = parse_embedding_response("not json at all", "test-model", 3).unwrap_err();
+        assert!(matches!(err, EnrichError::MalformedEnvelope(_)));
+    }
+
+    #[test]
+    fn parse_embedding_response_rejects_an_envelope_with_no_data() {
+        let err = parse_embedding_response(r#"{"data":[]}"#, "test-model", 3).unwrap_err();
+        assert!(matches!(err, EnrichError::NoEmbeddingData));
+    }
+
+    #[test]
+    fn parse_embedding_response_rejects_a_width_mismatch() {
+        let err =
+            parse_embedding_response(r#"{"data":[{"embedding":[0.1,0.2]}]}"#, "test-model", 3)
+                .unwrap_err();
+        match err {
+            EnrichError::UnexpectedDimensions { model, expected, got } => {
+                assert_eq!(model, "test-model");
+                assert_eq!(expected, 3);
+                assert_eq!(got, 2);
+            }
+            other => panic!("expected UnexpectedDimensions, got {other:?}"),
+        }
     }
 
     #[test]

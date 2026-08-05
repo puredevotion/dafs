@@ -84,6 +84,46 @@ export async function fetchFacets(field) {
 }
 
 /**
+ * One M03 semantic search result: a timeline row plus how far its embedding
+ * sat from the query's, closest (smallest) first — mirrors
+ * `dafs_api::search::SearchHit`'s `#[serde(flatten)]` shape, so every
+ * `TimelineItem` field above is present here too, alongside `distance`.
+ *
+ * @typedef {TimelineItem & { distance: number }} SearchHit
+ */
+
+/**
+ * Semantic search: embeds `q` against the daemon's configured embedding
+ * model and returns the nearest files, closest first.
+ *
+ * 503 is the expected response when M03 embeddings aren't configured on this
+ * daemon — the error's `status` field lets a caller distinguish "not
+ * configured" from any other failure and word the message accordingly,
+ * matching how `fetchEvents` already surfaces status rather than collapsing
+ * every failure into one generic message.
+ *
+ * @param {string} q
+ * @param {{ limit?: number, facets?: Record<string, string> }} [options]
+ *   `facets` is the same shape `fetchEvents` takes and means the same thing:
+ *   a facet field name mapped to the single value to filter on, with
+ *   empty/absent values omitted rather than sent as empty query params.
+ * @returns {Promise<{hits: SearchHit[]}>}
+ */
+export async function fetchSearch(q, { limit = 20, facets = {} } = {}) {
+  const params = new URLSearchParams({ q, limit: String(limit) });
+  for (const [field, value] of Object.entries(facets)) {
+    if (value) params.set(field, value);
+  }
+  const response = await fetch(`/search?${params}`);
+  if (!response.ok) {
+    const error = new Error(`/search returned HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+/**
  * Daemon version and schema.
  */
 export async function fetchVersion() {

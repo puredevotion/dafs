@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 dafs-store = { path = "../crates/dafs-store" }
 dafs-extract = { path = "../crates/dafs-extract" }
+dafs-enrich = { path = "../crates/dafs-enrich" }
 tempfile = "3"
 
 # The fuzz crate is intentionally OUTSIDE the workspace: cargo-fuzz builds it
@@ -63,6 +64,24 @@ bench = false
 [[bin]]
 name = "exif_extract"
 path = "fuzz_targets/exif_extract.rs"
+test = false
+doc = false
+bench = false
+
+# `dafs-enrich`'s two response parsers — network-supplied JSON, the same
+# untrusted-input class every extractor target above already covers, per
+# `docs/m03-semantic-search.md`'s "Deliberately not done" note that this was
+# an existing M02b gap ("this now applies to a second parser").
+[[bin]]
+name = "enrich_response"
+path = "fuzz_targets/enrich_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "embed_response"
+path = "fuzz_targets/embed_response.rs"
 test = false
 doc = false
 bench = false
