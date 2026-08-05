@@ -1,0 +1,16 @@
+# Scope: .github/workflows/*.yml — the only committed YAML in this repo
+# (ci/dagger.json is JSON, not YAML). Extends the default ruleset with looser
+# line-length (GitHub Actions `run:` blocks and step names routinely exceed
+# 80 chars) since the goal here is catching real mistakes (bad indentation,
+# duplicate keys, trailing whitespace), not enforcing a house style.
+extends: default
+
+rules:
+  line-length:
+    max: 120
+  # GH Actions workflow files commonly leave a document-start marker off;
+  # truthy `on:` is a YAML 1.1 boolean gotcha this repo's workflows rely on
+  # GitHub's own parser to handle, not something to flag here.
+  document-start: disable
+  truthy:
+    check-keys: false
