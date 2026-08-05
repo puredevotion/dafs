@@ -1,7 +1,7 @@
 [package]
 name = "dafs-vecstore"
 description = "DAFS vector search: registers the sqlite-vec extension for dafs-store"
-version = "0.0.4"
+version = "0.0.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
