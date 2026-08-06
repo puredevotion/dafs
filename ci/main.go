@@ -314,22 +314,43 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 		Stdout(ctx)
 }
 
-// Gitleaks scans `base..HEAD` for hardcoded secrets.
+// Gitleaks scans for hardcoded secrets: `base..HEAD` when given a base, the
+// whole history when not.
 //
 // Backstop for .githooks/pre-push, the same pairing CommitLint is to the
-// commit-msg hook. `base` defaults to "main" if empty — same convention as
-// CommitLint, for the same reason: a local `dagger call` has no PR context to
-// read a base ref from, unlike the GitHub workflow's `gitleaks` job.
+// commit-msg hook.
+//
+// An empty base used to mean "main", which made this gate DECORATIVE wherever it
+// mattered most: Check passes "" and nightly.yml runs on main, so the range was
+// `main..HEAD` with HEAD == main — empty, zero commits scanned, always green.
+// Measured 2026-08-06 against a planted high-entropy PAT: `HEAD~1..HEAD` reports
+// "1 commits scanned / leaks found: 1" and exits 1, while `HEAD..HEAD` exits 0
+// having scanned nothing. Full history is the only default that cannot be empty.
+//
+// The range is also verified before scanning, because gitleaks exits 0 on a
+// range it cannot resolve — so a typo'd or missing base ref reported "clean"
+// rather than failing, which is the worst possible outcome for a secret gate.
 func (m *DafsCi) Gitleaks(ctx context.Context, source *dagger.Directory, base string) (string, error) {
-	if base == "" {
-		base = "main"
-	}
+	script := `set -e
+if [ -n "${BASE:-}" ]; then
+  git rev-parse --verify "${BASE}^{commit}" >/dev/null 2>&1 || {
+    echo "base ref '${BASE}' does not resolve — refusing to report clean" >&2
+    exit 1
+  }
+  if [ "$(git rev-list --count "${BASE}..HEAD")" -eq 0 ]; then
+    echo "range ${BASE}..HEAD is empty — nothing would be scanned" >&2
+    exit 1
+  fi
+  exec gitleaks git --log-opts="${BASE}..HEAD" --redact --no-banner .
+fi
+exec gitleaks git --redact --no-banner .`
 
 	return dag.Container().
 		From(gitleaksImage).
 		WithDirectory("/src", source).
 		WithWorkdir("/src").
-		WithExec([]string{"gitleaks", "git", "--log-opts=" + base + "..HEAD", "--redact", "--no-banner", "."}).
+		WithEnvVariable("BASE", base).
+		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
 }
 
