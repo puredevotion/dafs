@@ -379,10 +379,30 @@ func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, er
 		WithEnvVariable("DAFS_LISTEN", "0.0.0.0:7878").
 		WithEnvVariable("DAFS_DATA_DIR", "/tmp/data").
 		WithEnvVariable("DAFS_WATCH", "/tmp/corpus").
+		// The daemon forks by default (dafs-daemon/src/main.rs: detach defaults
+		// to true) and its own help says to pass false "under a supervisor that
+		// already manages the process and expects it not to fork" — a Dagger
+		// service being exactly that. Left on, the parent exits 0 in 0.2s, the
+		// service has no process, and nuclei fails instantly against nothing.
+		// Logs go to <data-dir>/dafs.log when detached, which is why that failure
+		// produced no stderr at all.
+		WithEnvVariable("DAFS_DETACH", "false").
 		WithDirectory("/tmp/corpus", dag.Directory().
 			WithNewFile("note.md", "hello").
 			WithNewFile("docs/readme.txt", "world")).
+		// DAFS_DATA_DIR must be writable by the image's nonroot uid (65532).
+		// Permissions carried in a Directory snapshot, NOT Owner: on engine
+		// v0.21.7 Owner is a silent no-op on every API it appears on, so the
+		// daemon exits before binding and the whole scan fails with no output.
+		WithDirectory("/", dag.Directory().
+			WithNewDirectory("tmp/data", dagger.DirectoryWithNewDirectoryOpts{
+				Permissions: 0o777,
+			})).
 		WithExposedPort(7878).
+		// distroless/cc carries no ENTRYPOINT or CMD, so without this AsService
+		// has nothing to start and the whole check dies before nuclei runs, with
+		// "no service command has been set" — which is what it did every time.
+		WithEntrypoint([]string{"/dafs"}).
 		AsService()
 
 	return dag.Container().
@@ -393,7 +413,12 @@ func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, er
 		// caches in rustBase) turns every run after the first into a no-op
 		// fetch instead of a full clone — this is what "pre-installed"
 		// means for a raw container rather than a hosted action's own cache.
-		WithMountedCache("/root/.config/nuclei", dag.CacheVolume("dafs-nuclei-templates")).
+		//
+		// /root/nuclei-templates, NOT /root/.config/nuclei: v3 keeps config in
+		// the latter and the templates in the former ("Successfully installed
+		// nuclei-templates at /root/nuclei-templates"), so the old path cached
+		// the config and re-downloaded 1764 templates every single run.
+		WithMountedCache("/root/nuclei-templates", dag.CacheVolume("dafs-nuclei-templates")).
 		WithServiceBinding("dafs", service).
 		// Fail the check only on findings that are actually actionable;
 		// informational output on an unauthenticated local API is noise.
