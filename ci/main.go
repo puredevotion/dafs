@@ -691,7 +691,11 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory, fuzzSecond
 	}
 
 	if failed > 0 {
-		return report.String(), fmt.Errorf("%d of %d checks failed", failed, len(checks))
+		// The report goes in the ERROR, not just the return value. Dagger prints a
+		// failing call's error and discards its returned string, and nightly.yml
+		// calls this with --silent, so "7 of 17 checks failed" was the entire
+		// output of a 38-minute run — which of the seven was unknowable.
+		return report.String(), fmt.Errorf("%d of %d checks failed:\n%s", failed, len(checks), report.String())
 	}
 	fmt.Fprintf(&report, "\nall %d checks passed\n", len(checks))
 	return report.String(), nil
