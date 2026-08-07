@@ -314,22 +314,43 @@ func (m *DafsCi) PrivateRefs(ctx context.Context, source *dagger.Directory) (str
 		Stdout(ctx)
 }
 
-// Gitleaks scans `base..HEAD` for hardcoded secrets.
+// Gitleaks scans for hardcoded secrets: `base..HEAD` when given a base, the
+// whole history when not.
 //
 // Backstop for .githooks/pre-push, the same pairing CommitLint is to the
-// commit-msg hook. `base` defaults to "main" if empty — same convention as
-// CommitLint, for the same reason: a local `dagger call` has no PR context to
-// read a base ref from, unlike the GitHub workflow's `gitleaks` job.
+// commit-msg hook.
+//
+// An empty base used to mean "main", which made this gate DECORATIVE wherever it
+// mattered most: Check passes "" and nightly.yml runs on main, so the range was
+// `main..HEAD` with HEAD == main — empty, zero commits scanned, always green.
+// Measured 2026-08-06 against a planted high-entropy PAT: `HEAD~1..HEAD` reports
+// "1 commits scanned / leaks found: 1" and exits 1, while `HEAD..HEAD` exits 0
+// having scanned nothing. Full history is the only default that cannot be empty.
+//
+// The range is also verified before scanning, because gitleaks exits 0 on a
+// range it cannot resolve — so a typo'd or missing base ref reported "clean"
+// rather than failing, which is the worst possible outcome for a secret gate.
 func (m *DafsCi) Gitleaks(ctx context.Context, source *dagger.Directory, base string) (string, error) {
-	if base == "" {
-		base = "main"
-	}
+	script := `set -e
+if [ -n "${BASE:-}" ]; then
+  git rev-parse --verify "${BASE}^{commit}" >/dev/null 2>&1 || {
+    echo "base ref '${BASE}' does not resolve — refusing to report clean" >&2
+    exit 1
+  }
+  if [ "$(git rev-list --count "${BASE}..HEAD")" -eq 0 ]; then
+    echo "range ${BASE}..HEAD is empty — nothing would be scanned" >&2
+    exit 1
+  fi
+  exec gitleaks git --log-opts="${BASE}..HEAD" --redact --no-banner .
+fi
+exec gitleaks git --redact --no-banner .`
 
 	return dag.Container().
 		From(gitleaksImage).
 		WithDirectory("/src", source).
 		WithWorkdir("/src").
-		WithExec([]string{"gitleaks", "git", "--log-opts=" + base + "..HEAD", "--redact", "--no-banner", "."}).
+		WithEnvVariable("BASE", base).
+		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
 }
 
@@ -358,10 +379,30 @@ func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, er
 		WithEnvVariable("DAFS_LISTEN", "0.0.0.0:7878").
 		WithEnvVariable("DAFS_DATA_DIR", "/tmp/data").
 		WithEnvVariable("DAFS_WATCH", "/tmp/corpus").
+		// The daemon forks by default (dafs-daemon/src/main.rs: detach defaults
+		// to true) and its own help says to pass false "under a supervisor that
+		// already manages the process and expects it not to fork" — a Dagger
+		// service being exactly that. Left on, the parent exits 0 in 0.2s, the
+		// service has no process, and nuclei fails instantly against nothing.
+		// Logs go to <data-dir>/dafs.log when detached, which is why that failure
+		// produced no stderr at all.
+		WithEnvVariable("DAFS_DETACH", "false").
 		WithDirectory("/tmp/corpus", dag.Directory().
 			WithNewFile("note.md", "hello").
 			WithNewFile("docs/readme.txt", "world")).
+		// DAFS_DATA_DIR must be writable by the image's nonroot uid (65532).
+		// Permissions carried in a Directory snapshot, NOT Owner: on engine
+		// v0.21.7 Owner is a silent no-op on every API it appears on, so the
+		// daemon exits before binding and the whole scan fails with no output.
+		WithDirectory("/", dag.Directory().
+			WithNewDirectory("tmp/data", dagger.DirectoryWithNewDirectoryOpts{
+				Permissions: 0o777,
+			})).
 		WithExposedPort(7878).
+		// distroless/cc carries no ENTRYPOINT or CMD, so without this AsService
+		// has nothing to start and the whole check dies before nuclei runs, with
+		// "no service command has been set" — which is what it did every time.
+		WithEntrypoint([]string{"/dafs"}).
 		AsService()
 
 	return dag.Container().
@@ -372,7 +413,12 @@ func (m *DafsCi) Dast(ctx context.Context, source *dagger.Directory) (string, er
 		// caches in rustBase) turns every run after the first into a no-op
 		// fetch instead of a full clone — this is what "pre-installed"
 		// means for a raw container rather than a hosted action's own cache.
-		WithMountedCache("/root/.config/nuclei", dag.CacheVolume("dafs-nuclei-templates")).
+		//
+		// /root/nuclei-templates, NOT /root/.config/nuclei: v3 keeps config in
+		// the latter and the templates in the former ("Successfully installed
+		// nuclei-templates at /root/nuclei-templates"), so the old path cached
+		// the config and re-downloaded 1764 templates every single run.
+		WithMountedCache("/root/nuclei-templates", dag.CacheVolume("dafs-nuclei-templates")).
 		WithServiceBinding("dafs", service).
 		// Fail the check only on findings that are actually actionable;
 		// informational output on an unauthenticated local API is noise.
@@ -691,7 +737,11 @@ func (m *DafsCi) Check(ctx context.Context, source *dagger.Directory, fuzzSecond
 	}
 
 	if failed > 0 {
-		return report.String(), fmt.Errorf("%d of %d checks failed", failed, len(checks))
+		// The report goes in the ERROR, not just the return value. Dagger prints a
+		// failing call's error and discards its returned string, and nightly.yml
+		// calls this with --silent, so "7 of 17 checks failed" was the entire
+		// output of a 38-minute run — which of the seven was unknowable.
+		return report.String(), fmt.Errorf("%d of %d checks failed:\n%s", failed, len(checks), report.String())
 	}
 	fmt.Fprintf(&report, "\nall %d checks passed\n", len(checks))
 	return report.String(), nil

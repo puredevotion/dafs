@@ -17,7 +17,11 @@
 
 set -eu
 
-repo_root=$(git rev-parse --show-toplevel)
+# Derived from this script's own path, NOT `git rev-parse --show-toplevel`. The
+# Dagger mirror (ci/main.go's CargoVersions) copies the tree into /src as a
+# Directory, so there is no .git and no git binary — rev-parse exited 127 there
+# on every nightly while the GitHub job passed, since a runner checkout has both.
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 reference_manifest=crates/dafs-daemon/Cargo.toml
