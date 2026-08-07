@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.0.5](https://github.com/puredevotion/dafs/compare/v0.0.4...v0.0.5) (2026-08-07)
+
+
+### Features
+
+* **search:** complete M03 semantic search end to end ([2d12afa](https://github.com/puredevotion/dafs/commit/2d12afaac6d99a204162544cb7b277e9fd5e0c23))
+* **search:** complete M03 semantic search end to end ([5b5f403](https://github.com/puredevotion/dafs/commit/5b5f40346e1d4050a1bed4a6146e2694ad387432))
+* **search:** lay the M03 vector-search foundation ([153cfee](https://github.com/puredevotion/dafs/commit/153cfee96505ca010e44dd732e4f14af26741146))
+
 ## [0.0.4](https://github.com/puredevotion/dafs/compare/v0.0.3...v0.0.4) (2026-07-26)
 
 
