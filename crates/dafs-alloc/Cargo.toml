@@ -1,7 +1,7 @@
 [package]
 name = "dafs-alloc"
 description = "Allocator selection and RSS measurement for the DAFS memory budget"
-version = "0.0.4"
+version = "0.0.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
