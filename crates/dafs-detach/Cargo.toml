@@ -17,4 +17,4 @@ publish = false
 # ecosystem; this crate exists so dafs-daemon's `forbid(unsafe_code)` never
 # has to be touched to use it — see lib.rs for where the one truly unsafe
 # call (fork) actually lives.
-nix = { version = "0.29", default-features = false, features = ["process", "fs"] }
+nix = { version = "0.31", default-features = false, features = ["process", "fs"] }

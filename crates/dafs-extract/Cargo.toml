@@ -10,13 +10,13 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-gix = "0.86.0"
+gix = "0.87.0"
 # default-features off: "cfb" (legacy MS Compound File detection, for old
 # .doc/.xls) and its wasm-bindgen pull-in are not needed — this crate only
 # ever runs natively and only sniffs formats it has an extractor for.
 infer = { version = "0.22.0", default-features = false, features = ["std"] }
 kamadak-exif = "0.6.1"
-quick-xml = "0.41.0"
+quick-xml = "0.42.0"
 thiserror.workspace = true
 tracing.workspace = true
 whatlang = "0.18.0"
