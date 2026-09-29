@@ -291,10 +291,12 @@ pub fn search(
 /// here in Rust rather than via a second `vec0 MATCH` (only the oversampled
 /// candidates from the bin-table pass ever reach this, never the full table).
 fn euclidean_distance(blob: &[u8], query: &[f32]) -> f64 {
-    blob.chunks_exact(4)
+    blob.as_chunks::<4>()
+        .0
+        .iter()
         .zip(query)
-        .map(|(bytes, &q)| {
-            let stored = f32::from_le_bytes(bytes.try_into().expect("chunks_exact(4)"));
+        .map(|(&bytes, &q)| {
+            let stored = f32::from_le_bytes(bytes);
             let diff = f64::from(stored) - f64::from(q);
             diff * diff
         })
