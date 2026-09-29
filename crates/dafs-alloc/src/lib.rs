@@ -72,10 +72,21 @@ pub const ALLOCATOR: Allocator = Jemalloc;
 /// documents as the intended override point, and only one allocator is linked.
 /// The allow is scoped to this item alone, so the crate-level
 /// `deny(unsafe_code)` still covers everything else.
+///
+/// `thp:never` disables jemalloc's transparent-huge-page hinting on its own
+/// mappings. Without it, a kernel with THP set to `madvise`/`always` can back
+/// a jemalloc chunk with a 2 MiB huge page for a fraction of that chunk's
+/// bytes actually in use, and the *first touch* of a huge page charges the
+/// whole 2 MiB to RSS rather than the 4 KiB page actually needed — CI's idle
+/// ceiling measures exactly that number. This does not trade away the decay
+/// tuning above: it only stops a page from being promoted to huge in the
+/// first place, so dirty/muzzy decay still returns ordinary 4 KiB pages the
+/// same way.
 #[cfg(not(target_env = "msvc"))]
 #[allow(non_upper_case_globals, unsafe_code)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,thp:never\0";
 
 /// Resident set size in bytes, or `None` if it could not be read.
 ///
