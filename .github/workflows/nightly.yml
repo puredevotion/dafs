@@ -38,7 +38,7 @@ jobs:
       - name: Save under today's date-keyed cache entry
         id: date
         run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         with:
           path: ~/.cache/grype/db
           key: grype-db-${{ steps.date.outputs.today }}
