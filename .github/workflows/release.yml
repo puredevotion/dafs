@@ -135,7 +135,7 @@ jobs:
       # One call, two subjects: the tarball and its detached checksum both get
       # covered by the same provenance statement, rather than attesting only
       # the binary and leaving the checksum file unattested alongside it.
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
             ${{ matrix.name }}.tar.gz
@@ -188,7 +188,7 @@ jobs:
       # The SBOM is a shipped release artifact like the tarballs are — attest
       # it too, so "max provenance" covers what describes the release, not
       # only the binary itself.
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: "**/*.cdx.json"
 
