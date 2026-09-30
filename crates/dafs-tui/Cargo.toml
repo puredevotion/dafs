@@ -28,4 +28,4 @@ crossterm = "0.28"
 # TLS off: this talks to a loopback HTTP daemon, and pulling in a TLS stack
 # for a status client that never needs one is exactly the kind of dependency
 # weight the rest of this workspace avoids. `json` enables `Response::into_json`.
-ureq = { version = "2", default-features = false, features = ["json"] }
+ureq = { version = "3", default-features = false, features = ["json"] }

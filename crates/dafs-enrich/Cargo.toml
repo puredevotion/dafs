@@ -16,7 +16,7 @@ thiserror.workspace = true
 tracing.workspace = true
 # "tls" on top of dafs-tui's json-only config: a hosted endpoint needs HTTPS,
 # where dafs-tui only ever talks to the daemon's own loopback HTTP.
-ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+ureq = { version = "3", default-features = false, features = ["json", "tls"] }
 
 [dev-dependencies]
 tempfile = "3"
