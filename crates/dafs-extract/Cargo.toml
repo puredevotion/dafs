@@ -16,7 +16,7 @@ gix = "0.88.0"
 # ever runs natively and only sniffs formats it has an extractor for.
 infer = { version = "0.22.0", default-features = false, features = ["std"] }
 kamadak-exif = "0.6.1"
-quick-xml = "0.41.0"
+quick-xml = "0.42.0"
 thiserror.workspace = true
 tracing.workspace = true
 whatlang = "0.18.0"
