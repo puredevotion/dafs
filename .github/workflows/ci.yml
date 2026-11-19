@@ -321,7 +321,7 @@ jobs:
       # key stays valid run to run — bump the tag and this key together.
       - name: Cache ZAP image
         id: zap-image-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/zap-image.tar
           key: zap-image-ghcr.io-zaproxy-zaproxy-2.16.1
@@ -502,7 +502,7 @@ jobs:
       # `key` never matches anything real, forcing the prefix `restore-keys`
       # match against whatever nightly.yml last saved.
       - name: Restore grype DB cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/grype/db
           key: grype-db-none
