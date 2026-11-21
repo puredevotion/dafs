@@ -347,4 +347,4 @@ jobs:
             "Source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}
           Run: ${RUN_URL}
           Image: ${IMAGE}:${VERSION}@${DIGEST}" \
-            "zot.home.arpa/homelab/dafs~zot.home.arpa/puredevotion/dafs=${VERSION}"
+            "@dafs=${VERSION}"
