@@ -44,11 +44,10 @@ themselves — including as test fixtures.
 ## Commit messages
 
 [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope): …`,
-`fix(scope): …`, `docs: …`, etc.). Version bumps and `CHANGELOG.md` are generated from
-these by release-please — an inaccurate type or scope shows up in the next release's
-changelog, not just in `git log`. A commit it can't parse isn't rejected there, it's
-silently excluded from that decision — which is how `v0.0.1` shipped tagged by hand,
-with no changelog entry.
+`fix(scope): …`, `docs: …`, etc.). Every merge to `main` that
+touches the daemon is released by `release.yml`: `feat` bumps the minor, `!` or
+`BREAKING CHANGE:` the major, anything else the patch. Release notes are GitHub's
+generated notes; `CHANGELOG.md` is historical up to v0.0.5.
 
 Run `./scripts/install-hooks.sh` once per clone (or just `nix develop` — the devShell
 does it for you) to get a `commit-msg` hook that rejects a non-conforming subject

@@ -12,7 +12,7 @@
 # knowing about. Keep the two in step — a check added here belongs in ci/main.go
 # too, and vice versa.
 #
-# Release builds and artifacts live in release.yml, on version tags only.
+# Releases live in release.yml: every merge to main that touches the daemon.
 name: CI
 
 on:
@@ -34,12 +34,9 @@ env:
 
 jobs:
   commit-lint:
-    # release-please (release-please.yml) derives the version bump and
-    # CHANGELOG.md entry from each commit subject on main. A non-conforming
-    # commit isn't an error there — it's silently excluded from that decision,
-    # which is how v0.0.1 shipped with an empty changelog. This job is the
-    # backstop for the local commit-msg hook (scripts/install-hooks.sh),
-    # since --no-verify bypasses that one.
+    # release.yml derives the version bump from each commit subject on main
+    # (feat -> minor, ! -> major, else patch). Backstop for the local
+    # commit-msg hook (scripts/install-hooks.sh), which --no-verify bypasses.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -66,9 +63,8 @@ jobs:
           echo "all commit subjects are Conventional Commits"
 
   cargo-versions:
-    # release-please's cargo-workspace plugin needs a literal semver in every
-    # member's [package.version] — see scripts/check-crate-versions.sh for the
-    # incident this guards against.
+    # Every member's literal [package.version] must match dafs-daemon's; see
+    # scripts/check-crate-versions.sh.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
