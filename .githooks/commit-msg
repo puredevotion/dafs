@@ -1,12 +1,10 @@
 #!/bin/sh
 # Rejects commit messages that are not Conventional Commits.
 #
-# release-please parses every commit's subject to decide the next version and
-# to write CHANGELOG.md (see release-please-config.json). A subject it can't
-# parse is silently dropped from that decision — not an error, just a release
-# that doesn't move, or a changelog missing an entry. This hook is the local
-# half of that gate; ci.yml's commit-lint job is the half nobody can bypass
-# with --no-verify.
+# release.yml (.github/scripts/next-version.sh) reads every subject on main to
+# pick the version bump; one it can't parse counts as a patch. This hook is the
+# local half of the gate; ci.yml's commit-lint job is the half --no-verify
+# cannot bypass.
 #
 # POSIX sh, no bashisms, to match scripts/install.sh's portability discipline.
 
@@ -15,7 +13,7 @@ set -eu
 msg_file="$1"
 subject=$(head -n1 "$msg_file")
 
-# Merge commits and fixups/squash markers aren't release-please input.
+# Merge commits and fixups/squash markers aren't release input.
 case "$subject" in
   "Merge "*|"fixup! "*|"squash! "*|"Revert "*)
     exit 0
@@ -29,8 +27,8 @@ if ! printf '%s' "$subject" | grep -qE "$pattern"; then
   cat >&2 <<EOF
 [commit-msg] rejected: "$subject"
 
-Conventional Commits required — release-please derives the version bump and
-CHANGELOG.md entry from this subject line (see CONTRIBUTING.md#commit-messages).
+Conventional Commits required — the release workflow derives the version bump
+from this subject line (see CONTRIBUTING.md#commit-messages).
 
   type(scope): subject
   types: feat fix docs style refactor perf test build ci chore revert

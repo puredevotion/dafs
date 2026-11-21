@@ -1,17 +1,9 @@
 #!/bin/sh
-# Guards against the regression that broke release-please's cargo-workspace
-# plugin twice in a row: it needs a literal semver in every member's
-# [package.version] to read and bump it. `version.workspace = true` parses as
-# a table, not a string, and release-please fails with "invalid
-# [package.version]" — see fix/release-please-cargo-workspace-versions.
-#
-# Also catches drift: a member whose literal version doesn't match
-# crates/dafs-daemon's — release-please tracks that crate
-# (release-please-config.json) and its `updateAllPackages` plugin option
-# should always move every member together, but a hand edit could desync them.
-# There's deliberately no workspace-level version to compare against instead
-# (see Cargo.toml's [workspace.package]): nothing inherits from one, so it
-# would just go stale.
+# Every crate keeps a literal [package.version] equal to crates/dafs-daemon's,
+# which flake.nix reads. Originally release-please's cargo-workspace plugin
+# needed it (it failed on `version.workspace = true`); releases are git tags now
+# (release.yml), but one literal, uniform version is still what the flake and
+# the binary's --version report.
 #
 # POSIX sh, no bashisms, to match scripts/install.sh's portability discipline.
 
@@ -39,7 +31,7 @@ fi
 bad=0
 for manifest in crates/*/Cargo.toml; do
   if grep -qE '^version\.workspace[[:space:]]*=[[:space:]]*true' "$manifest"; then
-    echo "::error::$manifest uses version.workspace = true — release-please's cargo-workspace plugin needs a literal version (\"$reference_version\")" >&2
+    echo "::error::$manifest uses version.workspace = true — every member keeps a literal version (\"$reference_version\")" >&2
     bad=1
     continue
   fi
