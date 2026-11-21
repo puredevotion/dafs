@@ -413,10 +413,13 @@ jobs:
         with:
           go-version-file: ci/go.mod
           cache-dependency-path: ci/go.sum
+      # Built from source with this job's Go (1.27.4): the prebuilt v2.12.2 was built with
+      # go1.26 and refuses a go1.27 module.
       - uses: golangci/golangci-lint-action@v9
         with:
           working-directory: ci
           version: v2.12.2
+          install-mode: goinstall
 
   yaml-lint:
     # The only committed YAML in this repo is .github/workflows/*.yml
