@@ -413,12 +413,12 @@ jobs:
         with:
           go-version-file: ci/go.mod
           cache-dependency-path: ci/go.sum
-      # Built from source with this job's Go (1.27.4): the prebuilt v2.12.2 was built with
-      # go1.26 and refuses a go1.27 module.
+      # Built from source with this job's Go 1.27.4. v2.12.2 couldn't type-check go1.27's stdlib;
+      # v2.15.0 can.
       - uses: golangci/golangci-lint-action@v9
         with:
           working-directory: ci
-          version: v2.12.2
+          version: v2.15.0
           install-mode: goinstall
 
   yaml-lint:
