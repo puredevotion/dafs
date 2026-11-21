@@ -405,7 +405,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Dagger CLI
-        run: curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR=/usr/local/bin sh
+        run: curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=0.21.12 BIN_DIR=/usr/local/bin sh
       - name: Generate ci/'s Go module files
         working-directory: ci
         run: dagger develop
