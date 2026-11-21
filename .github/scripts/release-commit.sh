@@ -2,8 +2,8 @@
 # release-commit.sh VERSION — sets every crate's [package] version (and their
 # Cargo.lock entries) to VERSION and commits that to main through GitHub's
 # createCommitOnBranch API, which signs the commit (main requires signatures).
-# Prints the new commit SHA. Needs GH_TOKEN with contents: write and a ruleset
-# bypass for GitHub Actions on main.
+# Prints the new commit SHA. GH_TOKEN: the homelab-arc App (main's ruleset
+# bypass actor), contents: write on dafs only.
 set -eu
 
 ver=$1

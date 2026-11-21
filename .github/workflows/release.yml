@@ -49,10 +49,20 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      # The App is main's ruleset bypass actor; the token is cut down to contents on dafs.
+      - name: release-commit token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
+        with:
+          client-id: ${{ vars.HOMELAB_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMELAB_DISPATCH_APP_PRIVATE_KEY }}
+          owner: puredevotion
+          repositories: dafs
+          permission-contents: write
       - name: next version
         id: next
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -eu
           ver=$(sh .github/scripts/next-version.sh v 0.0.6 crates ui/dist Cargo.toml Cargo.lock)
