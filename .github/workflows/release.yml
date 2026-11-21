@@ -42,7 +42,7 @@ jobs:
   version:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # pushes the release tag
+      contents: write # release commit + tag
     outputs:
       version: ${{ steps.next.outputs.version }}
     steps:
@@ -51,13 +51,18 @@ jobs:
           fetch-depth: 0
       - name: next version
         id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           ver=$(sh .github/scripts/next-version.sh v 0.0.6 crates ui/dist Cargo.toml Cargo.lock)
           if [ -z "$ver" ]; then
             echo "::notice::no daemon change since the last tag; nothing to release"
           elif [ -z "$(git tag --list "v${ver}")" ]; then
-            git tag "v${ver}" "$GITHUB_SHA"
+            # Crate versions move with the tag: a signed version commit on main, tagged.
+            sha=$(sh .github/scripts/release-commit.sh "$ver")
+            git fetch -q origin "$sha"
+            git tag "v${ver}" "$sha"
             git push origin "refs/tags/v${ver}"
             echo "::notice::tagged v${ver}"
           fi
@@ -69,6 +74,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           components: clippy, rustfmt
@@ -97,6 +104,8 @@ jobs:
             name: dafs-aarch64-linux
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           targets: ${{ matrix.target }}
@@ -148,6 +157,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
       - name: Generate CycloneDX SBOM
         run: |
@@ -199,6 +210,8 @@ jobs:
       DAGGER_NO_NAG: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
 
       - name: Install Dagger CLI (pinned, checksum-verified)
         env:
@@ -274,6 +287,8 @@ jobs:
       contents: write # creating the release and uploading assets
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
@@ -290,7 +305,6 @@ jobs:
   deploy:
     needs: [version, image]
     runs-on: ubuntu-latest
-    environment: homelab-release
     steps:
       - name: mint homelab-scoped installation token
         id: app
