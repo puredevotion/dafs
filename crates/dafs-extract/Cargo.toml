@@ -20,7 +20,7 @@ quick-xml = "0.41.0"
 thiserror.workspace = true
 tracing.workspace = true
 whatlang = "0.18.0"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

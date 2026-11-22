@@ -37,7 +37,7 @@ axum = { version = "0.8", default-features = false, features = [
 # Metadata store. rusqlite over sqlx: no async layer, no connection pool, and a
 # far smaller dependency tree. The store is local-file, single-process, and
 # accessed from a blocking thread — an async SQL layer buys nothing here.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # Allocator. See crates/dafs-alloc for why this is not optional.
 tikv-jemallocator = "0.6"
