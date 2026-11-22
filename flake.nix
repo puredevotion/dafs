@@ -12,9 +12,8 @@
         pkgs = import nixpkgs { inherit system; };
 
         # Read the version from crates/dafs-daemon/Cargo.toml rather than
-        # duplicating it — that's the crate release-please tracks
-        # (release-please-config.json), and the one place a literal version
-        # is guaranteed current. Root Cargo.toml is a virtual workspace
+        # duplicating it — dafs-daemon is the reference every member matches
+        # (scripts/check-crate-versions.sh). Release tags may be newer. Root Cargo.toml is a virtual workspace
         # manifest with no [package] table at all.
         cargoToml = builtins.fromTOML (builtins.readFile ./crates/dafs-daemon/Cargo.toml);
       in

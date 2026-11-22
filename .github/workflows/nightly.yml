@@ -56,7 +56,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install Dagger CLI
-        run: curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR=/usr/local/bin sh
+        run: curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=0.21.12 BIN_DIR=/usr/local/bin sh
       - name: Run the full check suite with an extended fuzz campaign
         working-directory: ci
         run: dagger --silent call check --source=.. --fuzz-seconds=900

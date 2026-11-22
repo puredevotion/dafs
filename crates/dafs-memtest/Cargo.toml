@@ -17,5 +17,5 @@ tempfile.workspace = true
 # `dafs-extract`'s own `office.rs` tests already do exactly this for the
 # same reason: a real docx/xlsx/pptx-shaped archive without committing binary
 # fixtures for parts the reader code never looks at.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 serde_json.workspace = true

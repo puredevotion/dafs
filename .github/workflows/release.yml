@@ -1,76 +1,91 @@
-# Release pipeline: runs only on version tags.
+# A merge to main that touches the daemon is a release: tag vX.Y.Z (from the
+# commits since the last tag, .github/scripts/next-version.sh), publish the
+# binaries and the image, then point homelab at it. No release PR.
 #
-# Routine CI lives in two places that run the same checks — ci.yml here, and the
-# Dagger module in ci/ which runs anywhere. This workflow is the one thing that
-# is genuinely GitHub-specific: cutting a release, attaching artifacts, and
-# publishing provenance.
-#
-# # Supply-chain posture (SLSA)
-#
-# `actions/attest-build-provenance` is kept rather than switching to
-# slsa-framework/slsa-github-generator's reusable workflow — that generator is
-# what actually earns a certified SLSA Build L3 (an isolated, non-forkable
-# trusted builder that the calling workflow cannot influence after the fact);
-# a normal job in this workflow is not that, no matter how it's hardened, since
-# arbitrary steps here still run with the same token that signs the
-# attestation. What follows is "as good as that gets without adopting a
-# different builder", not a claim of certified L3:
-#
-#   - Every third-party action below is pinned to a commit SHA, not a
-#     floating tag, with the tag kept only as a trailing comment. A compromised
-#     or re-tagged action version cannot inject anything into a build whose
-#     provenance is then attested as trustworthy — this is the actual
-#     falsifiability gap between "provenance exists" and "provenance means
-#     something", and it's the one thing here fully in this repo's control.
-#   - Permissions are scoped per job, not just at the workflow level: only
-#     `build` and `sbom` carry `id-token`/`attestations` write, `verify` is
-#     read-only, and `publish` (which never builds anything) carries neither.
-#     A step compromised in one job cannot mint an attestation for another.
-#   - The build has no secrets and no network beyond crates.io/npm during
-#     dependency fetch (see `hermetic` in ci.yml) — there is nothing an
-#     attacker-controlled build step could exfiltrate that this token doesn't
-#     already make irrelevant, and nothing it could reach that isn't already
-#     public.
-#   - Every attestable output is attested, not just the primary binary: the
-#     tarball, its detached checksum, and the CycloneDX SBOM all get subjects
-#     ("max provenance" in the sense of maximal coverage of what ships).
-#
-# The Dagger module (`ci/`) mirrors `build` and `sbom` byte-for-byte so a
-# release is reproducible outside GitHub too, but it cannot mint this
-# attestation itself: Sigstore-backed signing needs the ambient OIDC identity
-# only GitHub Actions' `id-token: write` provides, and Dagger has no
-# equivalent when run standalone. That split is deliberate, not a gap — same
-# division `ci/main.go`'s own docs already draw for `publish`: Dagger produces
-# the artifact, the GitHub workflow that has the OIDC identity is what attests
-# and ships it.
+# The image goes to ghcr.io, not the homelab registry: this repo is public and
+# its CI stays on GitHub-hosted runners, so nothing here can reach the LAN.
+# homelab's Zot pulls puredevotion/dafs from ghcr.io on first use.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "ui/dist/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "ci/main.go"
+      - "ci/dagger.json"
+      - ".github/workflows/release.yml"
+      - ".github/scripts/next-version.sh"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to build (for a manual re-run)"
-        required: true
 
-# No default write access. Every job below states exactly what it needs.
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  DAGGER_VERSION: "0.21.12"
+  DAGGER_SHA256: "1c8a2949b461c488506e5e668d6e3a0ff3b90ad588fb151f9a8fe77845bc9d7f"
+  SYFT_VERSION: "1.57.2"
+  SYFT_SHA256: "ad92bd3ec1b94a3df01d4d0aec199afa9c42b72e86da436ff5f837914d32706b"
+  GRYPE_VERSION: "0.116.0"
+  GRYPE_SHA256: "40aff724297312f91ea390d003bed8d8651c74cc7f5b26732db80b3a408d2fc5"
+  IMAGE: ghcr.io/puredevotion/dafs
 
 jobs:
-  # Never publish a release that has not passed the full gate. This duplicates
-  # ci.yml deliberately: a tag can be pushed without the tagged commit ever
-  # having been through a pull request.
-  verify:
+  version:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # release commit + tag
+    outputs:
+      version: ${{ steps.next.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # The App is main's ruleset bypass actor; the token is cut down to contents on dafs.
+      - name: release-commit token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
+        with:
+          client-id: ${{ vars.HOMELAB_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMELAB_DISPATCH_APP_PRIVATE_KEY }}
+          owner: puredevotion
+          repositories: dafs
+          permission-contents: write
+      - name: next version
+        id: next
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -eu
+          ver=$(sh .github/scripts/next-version.sh v 0.0.6 crates ui/dist Cargo.toml Cargo.lock)
+          if [ -z "$ver" ]; then
+            echo "::notice::no daemon change since the last tag; nothing to release"
+          elif [ -z "$(git tag --list "v${ver}")" ]; then
+            # Crate versions move with the tag: a signed version commit on main, tagged.
+            sha=$(sh .github/scripts/release-commit.sh "$ver")
+            git fetch -q origin "$sha"
+            git tag "v${ver}" "$sha"
+            git push origin "refs/tags/v${ver}"
+            echo "::notice::tagged v${ver}"
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           components: clippy, rustfmt
@@ -84,7 +99,7 @@ jobs:
       - run: cargo test --release -p dafs-memtest -- --nocapture
 
   build:
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -99,13 +114,13 @@ jobs:
             name: dafs-aarch64-linux
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # jemalloc and bundled SQLite are C, so cross-compiling needs a cross
-      # linker and compiler — not just a Rust target.
       - name: Install cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -117,10 +132,8 @@ jobs:
       - name: Build
         run: cargo build --release -p dafs-daemon --target ${{ matrix.target }}
 
-      # Stripped here rather than in the release profile: cargo would apply a
-      # profile-level `strip` to build scripts and proc-macros too, and stripping
-      # those is a route to obscure build failures. Doing it in packaging affects
-      # only the artifact actually shipped.
+      # Strip here, not via the release profile: profile strip also hits
+      # build-script and proc-macro binaries (see ci/main.go Build).
       - name: Strip and package
         run: |
           BIN=target/${{ matrix.target }}/release/dafs
@@ -132,9 +145,6 @@ jobs:
           tar -czf ${{ matrix.name }}.tar.gz -C "$(dirname "$BIN")" dafs
           sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
 
-      # One call, two subjects: the tarball and its detached checksum both get
-      # covered by the same provenance statement, rather than attesting only
-      # the binary and leaving the checksum file unattested alongside it.
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
@@ -149,7 +159,7 @@ jobs:
             ${{ matrix.name }}.tar.gz.sha256
 
   sbom:
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -157,6 +167,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
       - name: Generate CycloneDX SBOM
         run: |
@@ -164,30 +176,28 @@ jobs:
           cargo cyclonedx --format json --all
           find . -name '*.cdx.json' -not -path './target/*' -print
 
-      # cargo-audit/cargo-deny (ci.yml's `audit` job) check the dependency
-      # graph cargo itself sees. This checks the SBOM that actually ships
-      # with the release instead — a real, if narrow, gap between the two:
-      # a mismatch here would mean the SBOM doesn't describe what cargo-audit
-      # already cleared, which is its own bug worth catching.
-      - name: Install grype
+      - name: Install grype (pinned, checksum-verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-            | sh -s -- -b /usr/local/bin v0.116.0
+          set -eu
+          gh release download "v${GRYPE_VERSION}" -R anchore/grype \
+            -p "grype_${GRYPE_VERSION}_linux_amd64.tar.gz" -O /tmp/grype.tar.gz --clobber
+          echo "${GRYPE_SHA256}  /tmp/grype.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/grype.tar.gz -C /usr/local/bin grype
           grype version
 
       - name: Scan the generated SBOM for known vulnerabilities
         run: |
           status=0
+          find . -name '*.cdx.json' -not -path './target/*' > sboms.txt
           while IFS= read -r sbom; do
             echo "::group::grype $sbom"
             grype "sbom:$sbom" --fail-on high || status=1
             echo "::endgroup::"
-          done < <(find . -name '*.cdx.json' -not -path './target/*')
+          done < sboms.txt
           exit "$status"
 
-      # The SBOM is a shipped release artifact like the tarballs are — attest
-      # it too, so "max provenance" covers what describes the release, not
-      # only the binary itself.
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: "**/*.cdx.json"
@@ -197,33 +207,167 @@ jobs:
           name: sbom
           path: "**/*.cdx.json"
 
+  image:
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # ghcr.io/puredevotion/dafs
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      DAGGER_NO_NAG: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Install Dagger CLI (pinned, checksum-verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release download "v${DAGGER_VERSION}" -R dagger/dagger \
+            -p "dagger_v${DAGGER_VERSION}_linux_amd64.tar.gz" -O /tmp/dagger.tar.gz --clobber
+          echo "${DAGGER_SHA256}  /tmp/dagger.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/dagger.tar.gz -C /usr/local/bin dagger
+          dagger version
+
+      - name: Build the OCI image
+        working-directory: ci
+        run: |
+          set -eu
+          dagger --silent call image --source=.. export --path=../dafs.tar
+          tar -tf ../dafs.tar >/dev/null
+
+      - name: Verify the packaged entrypoint
+        working-directory: ci
+        run: dagger --silent call verify-image --tarball=../dafs.tar
+
+      - name: Smoke test (ready, API, metrics, UI)
+        working-directory: ci
+        run: dagger --silent call smoke-test --tarball=../dafs.tar
+
+      # Report-only: the runtime is a Debian base this repo does not patch
+      # (libssl3 and friends); the crate graph is gated by the sbom job.
+      - name: Install syft + grype (pinned, checksum-verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release download "v${SYFT_VERSION}" -R anchore/syft \
+            -p "syft_${SYFT_VERSION}_linux_amd64.tar.gz" -O /tmp/syft.tar.gz --clobber
+          echo "${SYFT_SHA256}  /tmp/syft.tar.gz" | sha256sum -c -
+          gh release download "v${GRYPE_VERSION}" -R anchore/grype \
+            -p "grype_${GRYPE_VERSION}_linux_amd64.tar.gz" -O /tmp/grype.tar.gz --clobber
+          echo "${GRYPE_SHA256}  /tmp/grype.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/syft.tar.gz -C /usr/local/bin syft
+          sudo tar -xzf /tmp/grype.tar.gz -C /usr/local/bin grype
+
+      - name: SBOM + vulnerability report
+        run: |
+          set -eu
+          syft "oci-archive:dafs.tar" -o spdx-json=image.spdx.json
+          if ! grype "sbom:image.spdx.json" --only-fixed; then
+            echo "::warning::grype reported fixable findings in the dafs image (report only)"
+          fi
+
+      - name: Push to ghcr.io
+        id: push
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          skopeo copy --digestfile digest \
+            --dest-creds "${GITHUB_ACTOR}:${GHCR_TOKEN}" \
+            "oci-archive:dafs.tar" "docker://${IMAGE}:${VERSION}"
+          digest=$(cat digest)
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::unexpected digest '$digest'"; exit 1 ;;
+          esac
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          printf '### dafs %s\n\n%s\n' "$VERSION" "${IMAGE}:${VERSION}@${digest}" >> "$GITHUB_STEP_SUMMARY"
+
   publish:
-    needs: [build, sbom]
+    needs: [version, build, sbom, image]
     runs-on: ubuntu-latest
     permissions:
       contents: write # creating the release and uploading assets
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
       - name: Attach artifacts to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: v${{ needs.version.outputs.version }}
         run: |
-          # release-please (release-please.yml) creates the tag and the draft
-          # release with the generated changelog notes; this step only uploads
-          # build artifacts to it. `--clobber` makes a re-run idempotent.
-          #
-          # Fall back to creating the release here if one doesn't already exist —
-          # a workflow_dispatch re-run can target a tag release-please never saw.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" --clobber $(find artifacts -type f | tr '\n' ' ')
-          else
-            gh release create "$TAG" \
-              --draft \
-              --generate-notes \
-              --title "$TAG" \
-              $(find artifacts -type f | tr '\n' ' ')
-          fi
+          set -eu
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          find artifacts -type f -exec gh release upload "$TAG" --clobber {} +
+
+  deploy:
+    needs: [version, image]
+    runs-on: ubuntu-latest
+    steps:
+      # homelab's Zot syncs ghcr.io anonymously; pointing it at a private package = ImagePullBackOff.
+      - name: wait until the image is publicly pullable
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -eu
+          repo=${IMAGE#ghcr.io/}
+          i=0
+          while :; do
+            tok=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token) || tok=
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${repo}/manifests/${DIGEST}")
+            [ "$code" = 200 ] && break
+            [ "$i" -eq 0 ] &&
+              echo "::warning::${IMAGE} is not public (HTTP ${code}). Set package visibility to public; waiting 30 min."
+            i=$((i + 1))
+            if [ "$i" -gt 60 ]; then
+              echo "::error::${IMAGE}@${DIGEST} not anonymously pullable; homelab untouched. Make it public, re-run."
+              exit 1
+            fi
+            sleep 30
+          done
+      - name: mint homelab-scoped installation token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
+        with:
+          client-id: ${{ vars.HOMELAB_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMELAB_DISPATCH_APP_PRIVATE_KEY }}
+          owner: puredevotion
+          repositories: homelab
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: puredevotion/homelab
+          token: ${{ steps.app.outputs.token }}
+          path: .homelab
+          fetch-depth: 1
+          sparse-checkout: |
+            k8s
+            ci/release
+      # OLD~NEW moves the manifests off the retired homelab-built image; a no-op once moved.
+      - name: point homelab at the release
+        working-directory: .homelab
+        env:
+          RELEASE_BOT: ${{ steps.app.outputs.app-slug }}[bot]
+          VERSION: ${{ needs.version.outputs.version }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          sh ci/release/deploy-image.sh "deploy(dafs): ${VERSION}" \
+            "Source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}
+          Run: ${RUN_URL}
+          Image: ${IMAGE}:${VERSION}@${DIGEST}" \
+            "@dafs=${VERSION}"

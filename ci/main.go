@@ -31,6 +31,8 @@
 //	dagger call ui-bundle      --source=..     # rebuild the UI, diff vs committed
 //	dagger call dast           --source=..     # scanners against a live daemon
 //	dagger call image          --source=..     # OCI container
+//	dagger call verify-image   --tarball=dafs.tar  # the packaged entrypoint runs
+//	dagger call smoke-test     --tarball=dafs.tar  # ready, API, metrics, UI as a service
 //	dagger call build          --source=.. --target=x86_64-unknown-linux-gnu  # release tarball + sha256
 //	dagger call sbom           --source=..     # CycloneDX SBOM per crate
 //	dagger call sbom-scan      --source=..     # SBOM above, scanned for CVEs with grype
@@ -89,6 +91,8 @@ const (
 	// since this runs inside a Dagger container rather than directly on a
 	// GH-hosted runner.
 	nixToolsImage = "nixos/nix:2.35.1"
+	// HTTP client for SmokeTest: the distroless image has no shell or curl.
+	curlImage = "curlimages/curl:8.23.0"
 )
 
 // DafsCi is the CI module root.
@@ -130,10 +134,8 @@ func (m *DafsCi) rustBase(source *dagger.Directory, image string) *dagger.Contai
 // CommitLint asserts every commit subject in `base..HEAD` is a Conventional
 // Commit. `base` defaults to "main" if empty.
 //
-// release-please (release-please.yml) derives the version bump and
-// CHANGELOG.md entry from these subjects; a commit it can't parse is silently
-// excluded rather than erroring, which is how v0.0.1 shipped with an empty
-// changelog. Kept in lockstep with the commit-lint job in the GitHub workflow
+// release.yml's version job (.github/scripts/next-version.sh) derives the
+// version bump from these subjects; one it can't parse counts as a patch. Kept in lockstep with the commit-lint job in the GitHub workflow
 // and the local commit-msg hook in .githooks/.
 func (m *DafsCi) CommitLint(ctx context.Context, source *dagger.Directory, base string) (string, error) {
 	if base == "" {
@@ -167,10 +169,8 @@ echo "all commit subjects are Conventional Commits"`, pattern, base)
 // CargoVersions asserts every workspace member pins a literal
 // [package.version] matching [workspace.package].version.
 //
-// release-please's cargo-workspace plugin needs a literal semver to read and
-// bump per member; `version.workspace = true` parses as a table, not a
-// string, and broke every release-please run twice before
-// scripts/check-crate-versions.sh existed. Kept in lockstep with the
+// Every member keeps a literal semver equal to dafs-daemon's; see
+// scripts/check-crate-versions.sh. Kept in lockstep with the
 // cargo-versions job in the GitHub workflow.
 func (m *DafsCi) CargoVersions(ctx context.Context, source *dagger.Directory) (string, error) {
 	return dag.Container().
@@ -496,6 +496,69 @@ func (m *DafsCi) Image(source *dagger.Directory) *dagger.Container {
 		WithEnvVariable("DAFS_DATA_DIR", "/data").
 		WithExposedPort(7878).
 		WithEntrypoint([]string{"/dafs"})
+}
+
+// VerifyImage runs a packaged image's own entrypoint with --version: the
+// artifact release.yml pushes, not the source, is what a deployment runs.
+// UseEntrypoint because the Nix image's entrypoint is a /nix/store path, this
+// module's is /dafs.
+func (m *DafsCi) VerifyImage(ctx context.Context, tarball *dagger.File) (string, error) {
+	return dag.Container().
+		Import(tarball).
+		WithExec([]string{"--version"}, dagger.ContainerWithExecOpts{UseEntrypoint: true}).
+		Stdout(ctx)
+}
+
+// SmokeTest starts a packaged image as a service and asserts it becomes ready,
+// serves /version, reports a non-zero dafs_resident_bytes and serves the UI.
+// The RSS ceiling itself is RssCeiling's job; this only checks memory stays
+// observable once bound to 0.0.0.0 in a container.
+func (m *DafsCi) SmokeTest(ctx context.Context, tarball *dagger.File) (string, error) {
+	svc := dag.Container().
+		Import(tarball).
+		WithEnvVariable("DAFS_LISTEN", "0.0.0.0:7878").
+		WithEnvVariable("DAFS_DATA_DIR", "/data").
+		// AsService supervises; a forking daemon exits 0 at once and the
+		// service "exits before healthcheck".
+		WithEnvVariable("DAFS_DETACH", "false").
+		// Baked-in 0777 dir, not a mount: cache/dir Owner was a no-op on the
+		// homelab engine (sqlite error 14), and a persisted dafs.pid
+		// false-positives "already running" in a fresh PID namespace.
+		WithDirectory("/", dag.Directory().
+			WithNewDirectory("data", dagger.DirectoryWithNewDirectoryOpts{
+				Permissions: 0o777,
+			})).
+		WithExposedPort(7878).
+		AsService()
+
+	return dag.Container().
+		From(curlImage).
+		WithServiceBinding("dafs", svc).
+		WithExec([]string{"sh", "-c", `
+set -eu
+# The daemon binds, migrates, then flips /readyz: poll, do not sleep.
+for i in $(seq 1 60); do
+  if curl -fsS "http://dafs:7878/readyz" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 1
+done
+[ "${ready:-0}" = 1 ] || { echo "dafs never became ready"; exit 1; }
+
+echo "== /version =="
+curl -fsS "http://dafs:7878/version"; echo
+
+echo "== /metrics: RSS must be present and non-zero =="
+rss=$(curl -fsS "http://dafs:7878/metrics" | awk '/^dafs_resident_bytes /{print $2}')
+[ -n "$rss" ] || { echo "dafs_resident_bytes missing from /metrics"; exit 1; }
+[ "$rss" -gt 0 ] || { echo "dafs_resident_bytes is $rss"; exit 1; }
+echo "resident_bytes=$rss"
+
+echo "== / must serve the UI shell =="
+curl -fsS "http://dafs:7878/" | grep -q "<title>DAFS</title>" \
+  || { echo "UI shell not served at /"; exit 1; }
+
+echo "smoke test passed"
+`}).
+		Stdout(ctx)
 }
 
 // releaseTargets maps a Rust target triple to the asset name release.yml

@@ -10,7 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-gix = "0.88.0"
+gix = "0.90.0"
 # default-features off: "cfb" (legacy MS Compound File detection, for old
 # .doc/.xls) and its wasm-bindgen pull-in are not needed — this crate only
 # ever runs natively and only sniffs formats it has an extractor for.
@@ -20,7 +20,7 @@ quick-xml = "0.41.0"
 thiserror.workspace = true
 tracing.workspace = true
 whatlang = "0.18.0"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

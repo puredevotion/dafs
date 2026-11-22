@@ -4,9 +4,9 @@ members = ["crates/*"]
 
 [workspace.package]
 # No `version` here: every member sets its own literal version (see
-# scripts/check-crate-versions.sh) because release-please's cargo-workspace
-# plugin needs one, and a workspace-level version nothing inherits from would
-# just go stale.
+# scripts/check-crate-versions.sh). Releases are git tags (release.yml); these
+# stay at the last release-please version until that is decided, and a
+# workspace-level version nothing inherits from would just go stale.
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -37,7 +37,7 @@ axum = { version = "0.8", default-features = false, features = [
 # Metadata store. rusqlite over sqlx: no async layer, no connection pool, and a
 # far smaller dependency tree. The store is local-file, single-process, and
 # accessed from a blocking thread — an async SQL layer buys nothing here.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # Allocator. See crates/dafs-alloc for why this is not optional.
 tikv-jemallocator = "0.6"

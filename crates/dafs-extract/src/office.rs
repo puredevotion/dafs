@@ -113,10 +113,12 @@ fn open_zip(bytes: &[u8]) -> Result<Archive<'_>, Box<dyn Error>> {
 /// Zip entry names matching `{prefix}*{suffix}`, sorted for deterministic
 /// concatenation order. Matches e.g. `xl/worksheets/sheet1.xml` while
 /// naturally excluding `xl/worksheets/_rels/sheet1.xml.rels` (wrong prefix)
-/// without any dedicated rels-filtering logic.
+/// without any dedicated rels-filtering logic. A name that does not decode
+/// cannot be one of the ASCII OOXML part names, so it is skipped.
 fn entry_names(zip: &Archive<'_>, prefix: &str, suffix: &str) -> Vec<String> {
     let mut names: Vec<String> = zip
         .file_names()
+        .filter_map(Result::ok)
         .filter(|n| n.starts_with(prefix) && n.ends_with(suffix))
         .map(String::from)
         .collect();
