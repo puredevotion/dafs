@@ -330,9 +330,13 @@ jobs:
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
               "https://ghcr.io/v2/${repo}/manifests/${DIGEST}")
             [ "$code" = 200 ] && break
-            [ "$i" -eq 0 ] && echo "::warning::${IMAGE} is not public (HTTP ${code}). Set package visibility to public; waiting 30 min."
+            [ "$i" -eq 0 ] &&
+              echo "::warning::${IMAGE} is not public (HTTP ${code}). Set package visibility to public; waiting 30 min."
             i=$((i + 1))
-            [ "$i" -le 60 ] || { echo "::error::${IMAGE}@${DIGEST} still not anonymously pullable; homelab untouched. Make it public, re-run this job."; exit 1; }
+            if [ "$i" -gt 60 ]; then
+              echo "::error::${IMAGE}@${DIGEST} not anonymously pullable; homelab untouched. Make it public, re-run."
+              exit 1
+            fi
             sleep 30
           done
       - name: mint homelab-scoped installation token
