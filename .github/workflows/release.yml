@@ -67,7 +67,14 @@ jobs:
           set -eu
           ver=$(sh .github/scripts/next-version.sh v 0.0.6 crates ui/dist Cargo.toml Cargo.lock)
           if [ -z "$ver" ]; then
-            echo "::notice::no daemon change since the last tag; nothing to release"
+            # A run that died after tagging leaves a tag with no Release; finish that one.
+            last=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+            if [ -n "$last" ] && ! gh release view "$last" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              ver=${last#v}
+              echo "::notice::${last} has no Release; releasing it again"
+            else
+              echo "::notice::no daemon change since the last tag; nothing to release"
+            fi
           elif [ -z "$(git tag --list "v${ver}")" ]; then
             # Crate versions move with the tag: a signed version commit on main, tagged.
             sha=$(sh .github/scripts/release-commit.sh "$ver")
