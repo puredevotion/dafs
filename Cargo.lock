@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-alloc"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-api"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "axum",
  "dafs-alloc",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-daemon"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -527,14 +527,14 @@ dependencies = [
 
 [[package]]
 name = "dafs-detach"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "nix 0.29.0",
 ]
 
 [[package]]
 name = "dafs-enrich"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-extract"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "gix",
  "infer",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-memtest"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-pdf-worker"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "pdfium-render",
  "serde",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-scan"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "dafs-alloc",
  "dafs-store",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-store"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "dafs-vecstore",
  "rusqlite",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-tui"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "dafs-vecstore"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "rusqlite",
  "sqlite-vec",
