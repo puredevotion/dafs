@@ -40,7 +40,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Validate commit subjects are Conventional Commits
@@ -67,14 +67,14 @@ jobs:
     # scripts/check-crate-versions.sh.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check crate manifest versions
         run: ./scripts/check-crate-versions.sh
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -108,7 +108,7 @@ jobs:
     # the frontend without rebuilding cannot merge.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
@@ -154,7 +154,7 @@ jobs:
     # would hold up the fast feedback from `test`.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -170,7 +170,7 @@ jobs:
     # reaching out fails loudly.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Vendor dependencies and point cargo at them
@@ -187,7 +187,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -209,7 +209,7 @@ jobs:
     # history scan both need real history, not the default shallow clone.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -237,7 +237,7 @@ jobs:
     # scheduled concern once there is more surface to fuzz.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
 
@@ -274,7 +274,7 @@ jobs:
     # leaks a path, a crash on a malformed query.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -363,7 +363,7 @@ jobs:
     # fast check that catches the obvious cases.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Scan for private references
         run: |
           set -uo pipefail
@@ -383,7 +383,7 @@ jobs:
     # not on whoever next tries to deploy.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Build the flake package
@@ -403,7 +403,7 @@ jobs:
     # type-check against.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Dagger CLI
         run: curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=0.21.12 BIN_DIR=/usr/local/bin sh
       - name: Generate ci/'s Go module files
@@ -426,7 +426,7 @@ jobs:
     # (ci/dagger.json is JSON). Mirrors ci/main.go's YamlLint Dagger func.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install yamllint
         run: pip install --no-cache-dir yamllint==1.38.0
       - name: yamllint
@@ -439,7 +439,7 @@ jobs:
     # track the exact nixpkgs this repo already trusts.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: statix
@@ -457,7 +457,7 @@ jobs:
     # which this workspace has 39 of, each already audited).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install opengrep
         run: |
           curl -fsSL -o /usr/local/bin/opengrep \
@@ -482,7 +482,7 @@ jobs:
     # cleared. Mirrors ci/main.go's Sbom/SbomScan Dagger funcs.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
